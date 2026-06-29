@@ -33,9 +33,15 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 			return
 		}
 
-		upBody, incomingModel, targetModel, stream, err := s.prepareOpenAIRequest(body)
+		upBody, incomingModel, targetModel, stream, cacheKey, err := s.prepareOpenAIRequest(body)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+
+		// Attempt to serve from local response cache (non-streaming only).
+		if !stream && s.tryServeFromCache(w, r, cacheKey, incomingModel,
+			targetModel, false, string(body), r.URL.Path, start) {
 			return
 		}
 
@@ -115,37 +121,36 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 			s.relayOpenAIStream(w, resp, r, incomingModel, targetModel, body, start)
 			return
 		}
-		s.relayOpenAIJSON(w, resp, r, incomingModel, targetModel, stream, body, start)
+		s.relayOpenAIJSON(w, resp, r, incomingModel, targetModel, stream, body, start, cacheKey)
 	}
 }
 
 // prepareOpenAIRequest validates the JSON object and rewrites only its model
 // field, preserving extensions used by different OpenAI-compatible clients.
-func (s *Server) prepareOpenAIRequest(body []byte) ([]byte, string, string, bool, error) {
+// It returns the upstream body, incoming model, target model, stream flag, and
+// the prompt cache key (for response caching).
+func (s *Server) prepareOpenAIRequest(body []byte) ([]byte, string, string, bool, string, error) {
 	var payload map[string]json.RawMessage
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, "", "", false, fmt.Errorf("request body is not valid OpenAI JSON: %w", err)
+		return nil, "", "", false, "", fmt.Errorf("request body is not valid OpenAI JSON: %w", err)
 	}
 	if payload == nil {
-		return nil, "", "", false, fmt.Errorf("request body must be a JSON object")
+		return nil, "", "", false, "", fmt.Errorf("request body must be a JSON object")
 	}
 
 	var incomingModel string
 	if raw := payload["model"]; len(raw) > 0 {
 		if err := json.Unmarshal(raw, &incomingModel); err != nil {
-			return nil, "", "", false, fmt.Errorf("model must be a string")
+			return nil, "", "", false, "", fmt.Errorf("model must be a string")
 		}
 	}
 	var stream bool
 	if raw := payload["stream"]; len(raw) > 0 {
 		if err := json.Unmarshal(raw, &stream); err != nil {
-			return nil, "", "", false, fmt.Errorf("stream must be a boolean")
+			return nil, "", "", false, "", fmt.Errorf("stream must be a boolean")
 		}
 	}
 	if stream {
-		// Zen supports OpenAI's usage trailer. Request it when the client did
-		// not specify stream_options so API-key quotas and dashboard stats stay
-		// accurate without overriding an explicit client preference.
 		if raw, ok := payload["stream_options"]; !ok || string(raw) == "null" {
 			payload["stream_options"] = json.RawMessage(`{"include_usage":true}`)
 		}
@@ -154,11 +159,14 @@ func (s *Server) prepareOpenAIRequest(body []byte) ([]byte, string, string, bool
 	targetModel := s.cfg.ResolveModel(incomingModel)
 	payload["model"], _ = json.Marshal(targetModel)
 	proxy.ApplyRawOpenAIPromptCache(payload, promptCacheOptionsFromConfig(s.cfg.Snapshot()))
+
+	cacheKey := rawString(payload["prompt_cache_key"])
+
 	upBody, err := json.Marshal(payload)
 	if err != nil {
-		return nil, "", "", false, fmt.Errorf("could not encode upstream request: %w", err)
+		return nil, "", "", false, "", fmt.Errorf("could not encode upstream request: %w", err)
 	}
-	return upBody, incomingModel, targetModel, stream, nil
+	return upBody, incomingModel, targetModel, stream, cacheKey, nil
 }
 
 func (s *Server) relayOpenAIJSON(
@@ -169,6 +177,7 @@ func (s *Server) relayOpenAIJSON(
 	stream bool,
 	reqBody []byte,
 	start time.Time,
+	cacheKey string,
 ) {
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
@@ -184,6 +193,11 @@ func (s *Server) relayOpenAIJSON(
 		s.logFailed(r.Context(), r, incomingModel, targetModel, stream,
 			http.StatusBadGateway, msg, reqBody, time.Since(start))
 		return
+	}
+
+	// Store successful non-streaming responses in cache.
+	if !stream && resp.StatusCode == http.StatusOK {
+		s.storeInCache(cacheKey, targetModel, raw)
 	}
 
 	copyOpenAIHeaders(w.Header(), resp.Header, false)

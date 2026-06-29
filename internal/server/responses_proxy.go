@@ -63,6 +63,13 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 		}
 		applyResponsesThinkingMapping(chatReq, targetModel, cfg)
 		proxy.ApplyOpenAIPromptCache(chatReq, promptCacheOptionsFromConfig(cfg))
+
+		// Attempt to serve from local response cache (non-streaming only).
+		if !in.Stream && s.tryServeFromCache(w, r, chatReq.PromptCacheKey, incomingModel,
+			targetModel, false, string(body), r.URL.Path, start) {
+			return
+		}
+
 		upBody, err := json.Marshal(chatReq)
 		if err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, "api_error",
@@ -136,7 +143,7 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 			s.relayResponsesStream(w, resp, r, incomingModel, targetModel, body, start)
 			return
 		}
-		s.relayResponsesJSON(w, resp, r, incomingModel, targetModel, in.Stream, body, start)
+		s.relayResponsesJSON(w, resp, r, incomingModel, targetModel, in.Stream, body, start, chatReq.PromptCacheKey)
 	}
 }
 
@@ -315,6 +322,7 @@ func (s *Server) relayResponsesJSON(
 	stream bool,
 	reqBody []byte,
 	start time.Time,
+	cacheKey string,
 ) {
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
@@ -342,6 +350,11 @@ func (s *Server) relayResponsesJSON(
 		s.logFailed(r.Context(), r, incomingModel, targetModel, stream,
 			resp.StatusCode, message, reqBody, time.Since(start))
 		return
+	}
+
+	// Store successful non-streaming responses in cache.
+	if !stream && resp.StatusCode == http.StatusOK {
+		s.storeInCache(cacheKey, targetModel, raw)
 	}
 
 	chatResp, err := proxy.ParseOpenAIResponse(raw)

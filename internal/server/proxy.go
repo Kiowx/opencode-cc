@@ -73,6 +73,12 @@ func (s *Server) Proxy() http.HandlerFunc {
 			return
 		}
 
+		// Attempt to serve from local response cache (non-streaming only).
+		if !areq.Stream && s.tryServeFromCache(w, r, oreq.PromptCacheKey, areq.Model,
+			targetModel, false, string(body), r.URL.Path, start) {
+			return
+		}
+
 		// Marshal the upstream request.
 		upBody, err := json.Marshal(oreq)
 		if err != nil {
@@ -147,7 +153,7 @@ func (s *Server) Proxy() http.HandlerFunc {
 		if areq.Stream {
 			s.handleStreamResponse(w, resp, r, areq.Model, targetModel, body, start)
 		} else {
-			s.handleNonStreamResponse(w, resp, r, areq.Model, targetModel, body, start)
+			s.handleNonStreamResponse(w, resp, r, areq.Model, targetModel, body, start, oreq.PromptCacheKey)
 		}
 	}
 }
@@ -444,7 +450,7 @@ func (s *Server) passUpstreamError(w http.ResponseWriter, resp *http.Response, r
 
 // handleNonStreamResponse decodes the upstream JSON, converts it, and writes
 // the Anthropic response.
-func (s *Server) handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, r *http.Request, inModel, target string, reqBody []byte, start time.Time) {
+func (s *Server) handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, r *http.Request, inModel, target string, reqBody []byte, start time.Time, cacheKey string) {
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
@@ -452,6 +458,8 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, resp *http.Respo
 		s.logFailed(r.Context(), r, inModel, target, false, http.StatusBadGateway, err.Error(), reqBody, time.Since(start))
 		return
 	}
+	// Store in response cache before parsing (so we cache the raw upstream body).
+	s.storeInCache(cacheKey, target, raw)
 	oresp, err := proxy.ParseOpenAIResponse(raw)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "could not parse upstream response: "+err.Error())
