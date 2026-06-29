@@ -124,10 +124,31 @@ type Config struct {
 	// Anthropic thinking budget_tokens into provider-specific request fields.
 	ThinkingBudgetMappings []ThinkingBudgetMapping `json:"thinking_budget_mappings"`
 
+	// ResponseCacheEnabled caches upstream responses locally, keyed by
+	// prompt_cache_key, so repeated identical prompts return instantly.
+	ResponseCacheEnabled bool `json:"response_cache_enabled"`
+	// ResponseCacheTTLSeconds controls how long a cached response lives.
+	ResponseCacheTTLSeconds int `json:"response_cache_ttl_seconds"`
+	// ResponseCacheMaxEntries caps the in-memory cache size.
+	ResponseCacheMaxEntries int `json:"response_cache_max_entries"`
+	// ResponseCacheWarmupEnabled pre-populates the response cache on startup
+	// with the configured warmup prompts.
+	ResponseCacheWarmupEnabled bool `json:"response_cache_warmup_enabled"`
+	// ResponseCacheWarmupPrompts is a list of prompt templates sent on startup.
+	ResponseCacheWarmupPrompts []WarmupPrompt `json:"response_cache_warmup_prompts"`
+
 	dataDir     string
 	configPath  string
 	mu          sync.RWMutex
 	currentIdx  uint64 // sticky-primary cursor for NextUpstream (atomic); advances only on failure
+}
+
+// WarmupPrompt describes a request to send during cache warm-up.
+type WarmupPrompt struct {
+	Model       string            `json:"model"`
+	System      string            `json:"system,omitempty"`
+	UserMessage string            `json:"user_message"`
+	Tools       []json.RawMessage `json:"tools,omitempty"`
 }
 
 // Patch represents a partial update from the control panel. Pointer fields
@@ -154,6 +175,11 @@ type Patch struct {
 	PromptCacheAnthropicControl *bool                    `json:"prompt_cache_anthropic_control"`
 	PromptCacheNormalize        *bool                    `json:"prompt_cache_normalize"`
 	ThinkingBudgetMappings      *[]ThinkingBudgetMapping `json:"thinking_budget_mappings"`
+	ResponseCacheEnabled        *bool                    `json:"response_cache_enabled"`
+	ResponseCacheTTLSeconds     *int                     `json:"response_cache_ttl_seconds"`
+	ResponseCacheMaxEntries     *int                     `json:"response_cache_max_entries"`
+	ResponseCacheWarmupEnabled  *bool                    `json:"response_cache_warmup_enabled"`
+	ResponseCacheWarmupPrompts  *[]WarmupPrompt          `json:"response_cache_warmup_prompts"`
 }
 
 // Default returns a Config populated with sensible defaults.
@@ -173,6 +199,9 @@ func Default() *Config {
 		PromptCacheKeyPrefix:        "opencode-cc",
 		PromptCacheAnthropicControl: true,
 		PromptCacheNormalize:        true,
+		ResponseCacheEnabled:        true,
+		ResponseCacheTTLSeconds:     3600,
+		ResponseCacheMaxEntries:     256,
 		ThinkingBudgetMappings:      DefaultThinkingBudgetMappings(),
 	}
 }
@@ -353,6 +382,16 @@ func (c *Config) applyEnv() {
 			c.PromptCacheNormalize = b
 		}
 	}
+	if v := os.Getenv("OPENCODE_CC_RESPONSE_CACHE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.ResponseCacheEnabled = b
+		}
+	}
+	if v := os.Getenv("OPENCODE_CC_RESPONSE_CACHE_TTL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.ResponseCacheTTLSeconds = n
+		}
+	}
 }
 
 // Save persists the config to disk. Caller is responsible for holding any
@@ -403,6 +442,11 @@ func (c *Config) Snapshot() *Config {
 		PromptCacheKeyPrefix:        c.PromptCacheKeyPrefix,
 		PromptCacheAnthropicControl: c.PromptCacheAnthropicControl,
 		PromptCacheNormalize:        c.PromptCacheNormalize,
+		ResponseCacheEnabled:        c.ResponseCacheEnabled,
+		ResponseCacheTTLSeconds:     c.ResponseCacheTTLSeconds,
+		ResponseCacheMaxEntries:     c.ResponseCacheMaxEntries,
+		ResponseCacheWarmupEnabled:  c.ResponseCacheWarmupEnabled,
+		ResponseCacheWarmupPrompts:  c.ResponseCacheWarmupPrompts,
 	}
 	if c.ModelMappings != nil {
 		cp.ModelMappings = append([]ModelMapping(nil), c.ModelMappings...)
@@ -614,6 +658,21 @@ func (c *Config) ApplyPatch(src *Patch) {
 	}
 	if src.ThinkingBudgetMappings != nil {
 		c.ThinkingBudgetMappings = append([]ThinkingBudgetMapping(nil), (*src.ThinkingBudgetMappings)...)
+	}
+	if src.ResponseCacheEnabled != nil {
+		c.ResponseCacheEnabled = *src.ResponseCacheEnabled
+	}
+	if src.ResponseCacheTTLSeconds != nil && *src.ResponseCacheTTLSeconds > 0 {
+		c.ResponseCacheTTLSeconds = *src.ResponseCacheTTLSeconds
+	}
+	if src.ResponseCacheMaxEntries != nil && *src.ResponseCacheMaxEntries > 0 {
+		c.ResponseCacheMaxEntries = *src.ResponseCacheMaxEntries
+	}
+	if src.ResponseCacheWarmupEnabled != nil {
+		c.ResponseCacheWarmupEnabled = *src.ResponseCacheWarmupEnabled
+	}
+	if src.ResponseCacheWarmupPrompts != nil {
+		c.ResponseCacheWarmupPrompts = append([]WarmupPrompt(nil), (*src.ResponseCacheWarmupPrompts)...)
 	}
 }
 
