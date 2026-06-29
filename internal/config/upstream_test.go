@@ -4,9 +4,10 @@ import (
 	"testing"
 )
 
-// TestNextUpstreamRoundRobin verifies requests cycle through the enabled pool
-// in order, skipping disabled/empty-key entries.
-func TestNextUpstreamRoundRobin(t *testing.T) {
+// TestNextUpstreamStickyPrimary verifies requests always go to index 0
+// (primary) until MarkUpstreamFailed is called, which advances to the next
+// enabled upstream. Disabled and empty-key entries are skipped.
+func TestNextUpstreamStickyPrimary(t *testing.T) {
 	c := Default()
 	c.Upstreams = []Upstream{
 		{BaseURL: "https://a.example", APIKey: "ka", Enabled: true},
@@ -15,32 +16,31 @@ func TestNextUpstreamRoundRobin(t *testing.T) {
 		{BaseURL: "https://d.example", APIKey: "", Enabled: true},    // empty key, skipped
 	}
 
-	seen := map[string]int{}
+	// All 6 requests go to the primary (a) by default.
 	for i := 0; i < 6; i++ {
 		base, key, ok := c.NextUpstream()
 		if !ok {
 			t.Fatalf("request %d: expected ok", i)
 		}
-		seen[base]++
-		// key must match the base
-		want := "ka"
-		if base == "https://b.example" {
-			want = "kb"
-		}
-		if key != want {
-			t.Errorf("base %s: got key %q want %q", base, key, want)
+		if base != "https://a.example" || key != "ka" {
+			t.Errorf("request %d: got %s/%s, want a.example/ka", i, base, key)
 		}
 	}
-	// 6 requests over 2 enabled upstreams → 3 each
-	if seen["https://a.example"] != 3 || seen["https://b.example"] != 3 {
-		t.Errorf("expected 3/3 across a and b, got %v", seen)
+
+	// After marking failed, switch to b.
+	c.MarkUpstreamFailed()
+	base, key, ok := c.NextUpstream()
+	if !ok || base != "https://b.example" || key != "kb" {
+		t.Errorf("after failover: got %s/%s, want b.example/kb", base, key)
 	}
-	// disabled/empty must never be selected
-	if _, hit := seen["https://c.example"]; hit {
-		t.Errorf("disabled upstream c was selected")
-	}
-	if _, hit := seen["https://d.example"]; hit {
-		t.Errorf("empty-key upstream d was selected")
+
+	// disabled/empty must never be selected.
+	c.MarkUpstreamFailed()
+	_, _, ok = c.NextUpstream()
+	// After b, we wrap around since c and d are skipped → back to a.
+	base, key, ok = c.NextUpstream()
+	if !ok || base != "https://a.example" {
+		t.Errorf("after wrap: got %s, want a.example", base)
 	}
 }
 

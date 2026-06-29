@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -69,29 +70,64 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 			return
 		}
 
-		upURL := strings.TrimRight(upstream, "/") + "/v1/chat/completions"
-		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
-		if err != nil {
-			writeOpenAIError(w, http.StatusInternalServerError, "api_error",
-				"could not build upstream request: "+err.Error())
-			return
+		const maxRetries = 3
+		var resp *http.Response
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			curUpstream, curZenKey := upstream, zenKey
+			if attempt > 0 {
+				var ok bool
+				curUpstream, curZenKey, ok = s.cfg.NextUpstream()
+				if !ok {
+					const msg = "no upstream API key configured. Set one in the web panel (Settings → upstreams)."
+					writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", msg)
+					s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
+						http.StatusUnauthorized, "no upstream api key", body, time.Since(start))
+					return
+				}
+			}
+
+			upURL := strings.TrimRight(curUpstream, "/") + "/v1/chat/completions"
+			upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
+			if err != nil {
+				writeOpenAIError(w, http.StatusInternalServerError, "api_error",
+					"could not build upstream request: "+err.Error())
+				return
+			}
+			upReq.Header.Set("Authorization", "Bearer "+curZenKey)
+			upReq.Header.Set("Content-Type", "application/json")
+			upReq.Header.Set("User-Agent", "opencode-cc/1.2")
+			if in.Stream {
+				upReq.Header.Set("Accept", "text/event-stream")
+			} else {
+				upReq.Header.Set("Accept", "application/json")
+			}
+
+			httpClient := s.upstreamClient(in.Stream, cfg.RequestTimeoutSeconds)
+			resp, err = httpClient.Do(upReq)
+			if err != nil {
+				writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
+				s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
+					http.StatusBadGateway, err.Error(), body, time.Since(start))
+				return
+			}
+			if resp.StatusCode == http.StatusTooManyRequests && attempt < maxRetries {
+				s.cfg.MarkUpstreamFailed()
+				resp.Body.Close()
+				log.Printf("upstream 429 on %s attempt %d, failover to next key", incomingModel, attempt)
+				continue
+			}
+			break
 		}
-		upReq.Header.Set("Authorization", "Bearer "+zenKey)
-		upReq.Header.Set("Content-Type", "application/json")
-		upReq.Header.Set("User-Agent", "opencode-cc/1.2")
-		if in.Stream {
-			upReq.Header.Set("Accept", "text/event-stream")
-		} else {
-			upReq.Header.Set("Accept", "application/json")
+		if resp == nil {
+			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error",
+				"all upstream keys returned 429")
+			s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
+				http.StatusTooManyRequests, "all upstream keys returned 429", body, time.Since(start))
+			return
 		}
 
-		httpClient := s.upstreamClient(in.Stream, cfg.RequestTimeoutSeconds)
-		resp, err := httpClient.Do(upReq)
-		if err != nil {
-			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
-			s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
-				http.StatusBadGateway, err.Error(), body, time.Since(start))
-			return
+		if resp.StatusCode >= http.StatusBadRequest && shouldFailover(resp.StatusCode) {
+			s.cfg.MarkUpstreamFailed()
 		}
 
 		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
@@ -132,37 +168,69 @@ func (s *Server) proxyResponsesViaAnthropic(
 		return
 	}
 
-	upURL := strings.TrimRight(upstream, "/") + "/v1/messages"
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
-	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error",
-			"could not build upstream request: "+err.Error())
-		return
-	}
-	upReq.Header.Set("Authorization", "Bearer "+zenKey)
-	upReq.Header.Set("x-api-key", zenKey)
-	upReq.Header.Set("Content-Type", "application/json")
-	upReq.Header.Set("User-Agent", "opencode-cc/1.3")
-	if in.Stream {
-		upReq.Header.Set("Accept", "text/event-stream")
-	} else {
-		upReq.Header.Set("Accept", "application/json")
-	}
-	if version := r.Header.Get("anthropic-version"); version != "" {
-		upReq.Header.Set("anthropic-version", version)
-	} else {
-		upReq.Header.Set("anthropic-version", "2023-06-01")
-	}
-	if beta := r.Header.Get("anthropic-beta"); beta != "" {
-		upReq.Header.Set("anthropic-beta", beta)
-	}
+	const maxRetries = 3
 
-	httpClient := s.upstreamClient(in.Stream, cfg.RequestTimeoutSeconds)
-	resp, err := httpClient.Do(upReq)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
+	var resp *http.Response
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		curUpstream, curZenKey := upstream, zenKey
+		if attempt > 0 {
+			var ok bool
+			curUpstream, curZenKey, ok = s.cfg.NextUpstream()
+			if !ok {
+				const msg = "no upstream API key configured. Set one in the web panel (Settings → upstreams)."
+				writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", msg)
+				s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
+					http.StatusUnauthorized, "no upstream api key", reqBody, time.Since(start))
+				return
+			}
+		}
+
+		upURL := strings.TrimRight(curUpstream, "/") + "/v1/messages"
+		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
+		if err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "api_error",
+				"could not build upstream request: "+err.Error())
+			return
+		}
+		upReq.Header.Set("Authorization", "Bearer "+curZenKey)
+		upReq.Header.Set("x-api-key", curZenKey)
+		upReq.Header.Set("Content-Type", "application/json")
+		upReq.Header.Set("User-Agent", "opencode-cc/1.3")
+		if in.Stream {
+			upReq.Header.Set("Accept", "text/event-stream")
+		} else {
+			upReq.Header.Set("Accept", "application/json")
+		}
+		if version := r.Header.Get("anthropic-version"); version != "" {
+			upReq.Header.Set("anthropic-version", version)
+		} else {
+			upReq.Header.Set("anthropic-version", "2023-06-01")
+		}
+		if beta := r.Header.Get("anthropic-beta"); beta != "" {
+			upReq.Header.Set("anthropic-beta", beta)
+		}
+
+		httpClient := s.upstreamClient(in.Stream, cfg.RequestTimeoutSeconds)
+		resp, err = httpClient.Do(upReq)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
+			s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
+				http.StatusBadGateway, err.Error(), reqBody, time.Since(start))
+			return
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && attempt < maxRetries {
+			s.cfg.MarkUpstreamFailed()
+			resp.Body.Close()
+			log.Printf("upstream 429 on %s attempt %d, failover to next key", incomingModel, attempt)
+			continue
+		}
+		break
+	}
+	if resp == nil {
+		writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error",
+			"all upstream keys returned 429")
 		s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
-			http.StatusBadGateway, err.Error(), reqBody, time.Since(start))
+			http.StatusTooManyRequests, "all upstream keys returned 429", reqBody, time.Since(start))
 		return
 	}
 

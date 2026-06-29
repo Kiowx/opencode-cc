@@ -342,6 +342,9 @@ func (s *Server) doOpenAIChat(
 		return nil, fmt.Errorf("upstream response exceeded the maximum allowed size")
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
+		if shouldFailover(resp.StatusCode) {
+			s.cfg.MarkUpstreamFailed()
+		}
 		if msg := extractOpenAIError(raw); msg != "" {
 			return nil, fmt.Errorf("upstream returned status %d: %s", resp.StatusCode, msg)
 		}
