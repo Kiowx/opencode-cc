@@ -140,6 +140,15 @@ CREATE TABLE IF NOT EXISTS api_keys (
     created_at          INTEGER NOT NULL DEFAULT 0,
     expires_at          INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS response_cache (
+    cache_key       TEXT    PRIMARY KEY,
+    target_model    TEXT    NOT NULL DEFAULT '',
+    prompt_tokens   INTEGER NOT NULL DEFAULT 0,
+    body            BLOB   NOT NULL DEFAULT '',
+    created_at      INTEGER NOT NULL,
+    expires_at      INTEGER NOT NULL
+);
 `
 
 // RequestRow is the Go representation of a logged request.
@@ -386,6 +395,56 @@ SELECT duration_ms FROM requests WHERE duration_ms > 0 ORDER BY ts DESC LIMIT ?`
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// ResponseCacheRow is the on-disk representation of a cached response.
+type ResponseCacheRow struct {
+	CacheKey     string
+	TargetModel  string
+	PromptTokens int
+	Body         []byte
+	CreatedAt    time.Time
+	ExpiresAt    time.Time
+}
+
+// SaveResponseCacheEntry upserts one response cache row.
+func (s *Store) SaveResponseCacheEntry(ctx context.Context, key, model string, promptTokens int, body []byte, createdAt, expiresAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+INSERT OR REPLACE INTO response_cache (cache_key, target_model, prompt_tokens, body, created_at, expires_at)
+VALUES (?, ?, ?, ?, ?, ?)`,
+		key, model, promptTokens, body, createdAt.UnixMilli(), expiresAt.UnixMilli())
+	return err
+}
+
+// LoadResponseCacheEntries reads up to maxEntries non-expired cache rows,
+// ordered by creation time (most recent first).
+func (s *Store) LoadResponseCacheEntries(ctx context.Context, maxEntries int) ([]ResponseCacheRow, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT cache_key, target_model, prompt_tokens, body, created_at, expires_at
+FROM response_cache WHERE expires_at > ? ORDER BY created_at DESC LIMIT ?`,
+		time.Now().UnixMilli(), maxEntries)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ResponseCacheRow
+	for rows.Next() {
+		var r ResponseCacheRow
+		var ca, ea int64
+		if err := rows.Scan(&r.CacheKey, &r.TargetModel, &r.PromptTokens, &r.Body, &ca, &ea); err != nil {
+			return nil, err
+		}
+		r.CreatedAt = time.UnixMilli(ca)
+		r.ExpiresAt = time.UnixMilli(ea)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// DeleteExpiredResponseCache removes rows whose expiry has passed.
+func (s *Store) DeleteExpiredResponseCache(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM response_cache WHERE expires_at < ?`, time.Now().UnixMilli())
+	return err
 }
 
 func boolToInt(b bool) int {
