@@ -85,6 +85,11 @@ export interface PanelConfig {
   prompt_cache_key_prefix: string;
   prompt_cache_anthropic_control: boolean;
   prompt_cache_normalize: boolean;
+  response_cache_enabled: boolean;
+  response_cache_ttl_seconds: number;
+  response_cache_max_entries: number;
+  response_cache_warmup_enabled: boolean;
+  response_cache_warmup_prompts: { model: string; system?: string; user_message: string; tools?: any[] }[];
   thinking_budget_mappings: {
     match: string;
     field: string;

@@ -35,6 +35,13 @@ export default function Settings() {
   const [promptCacheKeyPrefix, setPromptCacheKeyPrefix] = useState("opencode-cc");
   const [promptCacheAnthropicControl, setPromptCacheAnthropicControl] = useState(true);
   const [promptCacheNormalize, setPromptCacheNormalize] = useState(true);
+  const [responseCache, setResponseCache] = useState(false);
+  const [responseCacheTTL, setResponseCacheTTL] = useState(3600);
+  const [responseCacheMaxEntries, setResponseCacheMaxEntries] = useState(256);
+  const [responseCacheWarmup, setResponseCacheWarmup] = useState(false);
+  const [responseCacheWarmupPrompts, setResponseCacheWarmupPrompts] = useState<
+    { model: string; system?: string; user_message: string; tools?: any[] }[]
+  >([]);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [flash, setFlash] = useState("");
@@ -61,6 +68,11 @@ export default function Settings() {
       setPromptCacheKeyPrefix(c.prompt_cache_key_prefix || "opencode-cc");
       setPromptCacheAnthropicControl(c.prompt_cache_anthropic_control);
       setPromptCacheNormalize(c.prompt_cache_normalize);
+      setResponseCache(c.response_cache_enabled);
+      setResponseCacheTTL(c.response_cache_ttl_seconds || 3600);
+      setResponseCacheMaxEntries(c.response_cache_max_entries || 256);
+      setResponseCacheWarmup(c.response_cache_warmup_enabled);
+      setResponseCacheWarmupPrompts(c.response_cache_warmup_prompts || []);
       // Seed the upstreams editor from the server view.
       const rows: UpstreamRow[] = (c.upstreams && c.upstreams.length ? c.upstreams : []).map((u) => ({
         base_url: u.base_url,
@@ -112,6 +124,11 @@ export default function Settings() {
         prompt_cache_key_prefix: promptCacheKeyPrefix,
         prompt_cache_anthropic_control: promptCacheAnthropicControl,
         prompt_cache_normalize: promptCacheNormalize,
+        response_cache_enabled: responseCache,
+        response_cache_ttl_seconds: responseCacheTTL,
+        response_cache_max_entries: responseCacheMaxEntries,
+        response_cache_warmup_enabled: responseCacheWarmup,
+        response_cache_warmup_prompts: responseCacheWarmupPrompts,
         upstreams: upstreams.map((u) => ({
           base_url: u.base_url,
           // empty api_key = keep existing (backend sentinel); only send typed value
@@ -512,6 +529,128 @@ export default function Settings() {
             }}
           />
         </div>
+      </Card>
+
+      <Card className="mb-4">
+        <div className="flex items-center gap-2 mb-4">
+          <CacheIcon />
+          <h3 className="text-sm font-semibold text-slate-200">响应缓存 (Response Cache)</h3>
+          {responseCache ? <Badge tone="green">已开启</Badge> : <Badge tone="amber">已关闭</Badge>}
+        </div>
+
+        <Toggle
+          label="启用响应缓存"
+          desc="缓存非流式请求的上游响应；相同请求直接返回缓存，避免重复上游调用。"
+          checked={responseCache}
+          onChange={(v) => { setResponseCache(v); setDirty(true); }}
+        />
+
+        <div className="mt-4">
+          <label className="label">缓存 TTL（秒）</label>
+          <input
+            type="number" className="input font-mono" min={60} max={86400}
+            value={responseCacheTTL}
+            onChange={(e) => { setResponseCacheTTL(Number(e.target.value)); setDirty(true); }}
+          />
+        </div>
+
+        <div className="mt-4">
+          <label className="label">最大缓存条目数</label>
+          <input
+            type="number" className="input font-mono" min={1} max={4096}
+            value={responseCacheMaxEntries}
+            onChange={(e) => { setResponseCacheMaxEntries(Number(e.target.value)); setDirty(true); }}
+          />
+        </div>
+
+        <div className="mt-4">
+          <Toggle
+            label="启动预热"
+            desc="服务启动时自动发送预热请求，预先填充缓存。"
+            checked={responseCacheWarmup}
+            onChange={(v) => { setResponseCacheWarmup(v); setDirty(true); }}
+          />
+        </div>
+
+        {responseCacheWarmupPrompts.map((wp, i) => (
+          <div key={i} className="mt-4 p-3 rounded-xl bg-ink-950/60 border border-white/[0.05]">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-semibold text-slate-300">预热提示 #{i + 1}</span>
+              <button
+                type="button"
+                className="text-xs text-accent-red hover:text-red-400"
+                onClick={() => {
+                  setResponseCacheWarmupPrompts((prev) => prev.filter((_, idx) => idx !== i));
+                  setDirty(true);
+                }}
+              >
+                删除
+              </button>
+            </div>
+            <label className="label">模型</label>
+            <input
+              className="input font-mono mb-2"
+              value={wp.model}
+              onChange={(e) => {
+                const next = [...responseCacheWarmupPrompts];
+                next[i] = { ...next[i], model: e.target.value };
+                setResponseCacheWarmupPrompts(next);
+                setDirty(true);
+              }}
+            />
+            <label className="label">System 提示（可选）</label>
+            <input
+              className="input mb-2"
+              value={wp.system || ""}
+              onChange={(e) => {
+                const next = [...responseCacheWarmupPrompts];
+                next[i] = { ...next[i], system: e.target.value };
+                setResponseCacheWarmupPrompts(next);
+                setDirty(true);
+              }}
+            />
+            <label className="label">用户消息</label>
+            <input
+              className="input mb-2"
+              value={wp.user_message}
+              onChange={(e) => {
+                const next = [...responseCacheWarmupPrompts];
+                next[i] = { ...next[i], user_message: e.target.value };
+                setResponseCacheWarmupPrompts(next);
+                setDirty(true);
+              }}
+            />
+            <label className="label">Tools（可选，JSON 数组，用于匹配代码补全工具调用）</label>
+            <textarea
+              className="input font-mono text-xs min-h-[80px]"
+              value={wp.tools ? JSON.stringify(wp.tools, null, 2) : ""}
+              onChange={(e) => {
+                const next = [...responseCacheWarmupPrompts];
+                try {
+                  next[i] = { ...next[i], tools: JSON.parse(e.target.value) };
+                } catch {
+                  next[i] = { ...next[i], tools: undefined };
+                }
+                setResponseCacheWarmupPrompts(next);
+                setDirty(true);
+              }}
+            />
+          </div>
+        ))}
+
+        <button
+          type="button"
+          className="btn-ghost !py-1.5 !text-xs mt-4"
+          onClick={() => {
+            setResponseCacheWarmupPrompts((prev) => [
+              ...prev,
+              { model: "", system: "", user_message: "" },
+            ]);
+            setDirty(true);
+          }}
+        >
+          + 添加预热提示
+        </button>
       </Card>
 
       <Card className="mb-4">
