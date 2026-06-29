@@ -124,10 +124,10 @@ type Config struct {
 	// Anthropic thinking budget_tokens into provider-specific request fields.
 	ThinkingBudgetMappings []ThinkingBudgetMapping `json:"thinking_budget_mappings"`
 
-	dataDir    string
-	configPath string
-	mu         sync.RWMutex
-	rr         uint64 // round-robin cursor for NextUpstream (atomic)
+	dataDir     string
+	configPath  string
+	mu          sync.RWMutex
+	currentIdx  uint64 // sticky-primary cursor for NextUpstream (atomic); advances only on failure
 }
 
 // Patch represents a partial update from the control panel. Pointer fields
@@ -243,8 +243,10 @@ func (c *Config) migrateLegacyUpstream() {
 	}
 }
 
-// NextUpstream returns the next backend by round-robin for a request.
-// Enabled upstreams with a non-empty key are cycled through atomically. If the
+// NextUpstream returns the current upstream using a sticky-primary strategy:
+// index 0 is used by default for maximum upstream-cache consistency. When the
+// caller detects a non-recoverable upstream error (401, 403, 429, 507, 5xx)
+// it calls MarkUpstreamFailed to advance to the next available upstream. If the
 // Upstreams pool is empty it falls back to the legacy single fields. ok is false
 // when no usable upstream is configured (the caller should respond with an
 // "upstream not configured" error).
@@ -266,13 +268,22 @@ func (c *Config) NextUpstream() (base, key string, ok bool) {
 		}
 		return "", "", false
 	}
-	// Atomic round-robin: advance the cursor and pick modulo the pool size.
-	// AddUint64 returns the new value; we use (old+1) % n to spread the first
-	// pick across callers.
-	n := uint64(len(pool))
-	idx := atomic.AddUint64(&c.rr, 1) % n
+	// Sticky-primary: always return the upstream at currentIdx until it fails.
+	// currentIdx advances only when MarkUpstreamFailed is called.
+	idx := atomic.LoadUint64(&c.currentIdx)
+	if int(idx) >= len(pool) {
+		idx = 0
+		atomic.StoreUint64(&c.currentIdx, 0)
+	}
 	u := pool[idx]
 	return strings.TrimRight(u.BaseURL, "/"), u.APIKey, true
+}
+
+// MarkUpstreamFailed advances the sticky cursor to the next upstream. Call this
+// when the current upstream returns an unrecoverable error (401 / 403 / 429 /
+// 507 / 5xx). The cursor wraps around after the last upstream.
+func (c *Config) MarkUpstreamFailed() {
+	atomic.AddUint64(&c.currentIdx, 1)
 }
 
 // applyEnv overlays environment variables on top of the loaded config.
