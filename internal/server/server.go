@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"time"
@@ -11,29 +12,41 @@ import (
 	"github.com/Kiowx/opencode-cc/internal/store"
 )
 
-// Server is the top-level HTTP server. It owns the config, store, and the
-// underlying *http.Server so it can be shut down cleanly.
+// Server is the top-level HTTP server. It owns the config, store, response
+// cache, and the underlying *http.Server so it can be shut down cleanly.
 type Server struct {
-	cfg        *config.Config
-	store      *store.Store
-	httpClient *http.Client
-	srv        *http.Server
+	cfg           *config.Config
+	store         *store.Store
+	httpClient    *http.Client
+	srv           *http.Server
+	responseCache *proxy.ResponseCache
 }
 
 // New constructs a Server. The store may be nil if request logging is disabled.
 func New(cfg *config.Config, st *store.Store) *Server {
-	return &Server{
-		cfg:   cfg,
-		store: st,
+	ttl := time.Duration(cfg.ResponseCacheTTLSeconds) * time.Second
+	maxEntries := cfg.ResponseCacheMaxEntries
+	if maxEntries <= 0 {
+		maxEntries = proxy.ResponseCacheDefaultMaxEntries
+	}
+	rc := proxy.NewResponseCache(ttl, maxEntries)
+	rc.SetEnabled(cfg.ResponseCacheEnabled)
+	rc.Start()
+	s := &Server{
+		cfg:           cfg,
+		store:         st,
 		httpClient: &http.Client{
-			Timeout: 0, // streaming: no global timeout (per-request override used)
+			Timeout: 0,
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 16,
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
+		responseCache: rc,
 	}
+	s.loadCacheFromStore()
+	return s
 }
 
 // Handler returns the root http.Handler wiring all routes. panelAssets serves
@@ -96,6 +109,8 @@ func (s *Server) Start(handler http.Handler) error {
 		ReadHeaderTimeout: 10 * time.Second,
 		// WriteTimeout left at 0 so long streams are not killed.
 	}
+	go s.warmupCache(context.Background())
+	go s.cleanupCacheStore()
 	return s.srv.ListenAndServe()
 }
 
