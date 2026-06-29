@@ -12,10 +12,9 @@ import (
 	"github.com/Kiowx/opencode-cc/internal/config"
 )
 
-// TestRoundRobinUpstreamsAcrossRequests verifies that consecutive proxy
-// requests cycle through the configured upstream pool, sending each to a
-// different upstream key in order.
-func TestRoundRobinUpstreamsAcrossRequests(t *testing.T) {
+// TestStickyPrimaryAcrossRequests verifies that consecutive proxy requests all
+// go to the primary upstream (index 0) until MarkUpstreamFailed is called.
+func TestStickyPrimaryAcrossRequests(t *testing.T) {
 	// Two mock upstreams that record which key hit them.
 	var mu sync.Mutex
 	hitsA, hitsB := []string{}, []string{}
@@ -55,7 +54,7 @@ func TestRoundRobinUpstreamsAcrossRequests(t *testing.T) {
 		"messages": []map[string]any{{"role": "user", "content": "hi"}},
 	})
 
-	// Fire 6 requests; expect alternating A/B by key.
+	// Fire 6 requests; all go to primary (A) with sticky-primary.
 	for i := 0; i < 6; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(string(body)))
 		rr := httptest.NewRecorder()
@@ -67,18 +66,12 @@ func TestRoundRobinUpstreamsAcrossRequests(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(hitsA) != 3 || len(hitsB) != 3 {
-		t.Fatalf("expected 3 hits each, got A=%d B=%d", len(hitsA), len(hitsB))
+	if len(hitsA) != 6 || len(hitsB) != 0 {
+		t.Fatalf("expected 6 hits on A (primary) and 0 on B, got A=%d B=%d", len(hitsA), len(hitsB))
 	}
-	// Every A hit must carry key-A, every B hit key-B.
 	for _, h := range hitsA {
 		if h != "Bearer key-A" {
 			t.Errorf("upstream A got wrong auth: %q", h)
-		}
-	}
-	for _, h := range hitsB {
-		if h != "Bearer key-B" {
-			t.Errorf("upstream B got wrong auth: %q", h)
 		}
 	}
 }
