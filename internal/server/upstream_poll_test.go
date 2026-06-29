@@ -42,6 +42,7 @@ func TestStickyPrimaryAcrossRequests(t *testing.T) {
 	defer zenB.Close()
 
 	cfg := config.Default()
+	cfg.ResponseCacheEnabled = false
 	cfg.Upstreams = []config.Upstream{
 		{BaseURL: zenA.URL, APIKey: "key-A", Enabled: true},
 		{BaseURL: zenB.URL, APIKey: "key-B", Enabled: true},
@@ -97,6 +98,7 @@ func TestModelsEndpointUsesPairedRoundRobinUpstream(t *testing.T) {
 	defer zenB.Close()
 
 	cfg := config.Default()
+	cfg.ResponseCacheEnabled = false
 	cfg.Upstreams = []config.Upstream{
 		{BaseURL: zenA.URL, APIKey: "key-A", Enabled: true},
 		{BaseURL: zenB.URL, APIKey: "key-B", Enabled: true},

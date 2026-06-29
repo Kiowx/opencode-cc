@@ -77,6 +77,7 @@ func newTestServer(t *testing.T, upstream string) (*Server, *store.Store) {
 	cfg.ZenAPIKey = "test-key"
 	cfg.NativeAnthropic = false
 	cfg.ModelMappings = []config.ModelMapping{{Match: "*", Target: "glm-4.6"}}
+	cfg.ResponseCacheEnabled = false
 	return newTestServerWithCfg(t, cfg)
 }
 

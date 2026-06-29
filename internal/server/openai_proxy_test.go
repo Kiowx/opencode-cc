@@ -120,7 +120,7 @@ func TestOpenAIChatCompletionsNonStream(t *testing.T) {
 
 func TestPrepareOpenAIRequestSortsTools(t *testing.T) {
 	srv, _, _ := newOpenAITestServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	upBody, incoming, target, stream, err := srv.prepareOpenAIRequest([]byte(`{
+	upBody, incoming, target, stream, _, err := srv.prepareOpenAIRequest([]byte(`{
 		"model":"client-model",
 		"messages":[{"role":"user","content":"hi"}],
 		"tools":[
