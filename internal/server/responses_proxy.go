@@ -51,11 +51,7 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 			return
 		}
 
-		if cfg.NativeAnthropic && proxy.IsNativeAnthropicModel(targetModel) {
-			s.proxyResponsesViaAnthropic(w, r, in, cfg, upstream, zenKey, incomingModel, targetModel, body, start)
-			return
-		}
-
+		// Convert to OpenAI struct early — needed for cache key regardless of path.
 		chatReq, err := proxy.ConvertResponsesRequest(in, func(string) string { return targetModel })
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
@@ -67,6 +63,11 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 		// Attempt to serve from local response cache (non-streaming only).
 		if !in.Stream && s.tryServeFromCache(w, r, chatReq.PromptCacheKey, incomingModel,
 			targetModel, false, string(body), r.URL.Path, start) {
+			return
+		}
+
+		if cfg.NativeAnthropic && proxy.IsNativeAnthropicModel(targetModel) {
+			s.proxyResponsesViaAnthropic(w, r, in, cfg, upstream, zenKey, incomingModel, targetModel, body, start, chatReq.PromptCacheKey)
 			return
 		}
 
@@ -156,6 +157,7 @@ func (s *Server) proxyResponsesViaAnthropic(
 	incomingModel, targetModel string,
 	reqBody []byte,
 	start time.Time,
+	cacheKey string,
 ) {
 	anthReq, err := proxy.ConvertResponsesToAnthropicRequest(in, func(string) string { return targetModel })
 	if err != nil {
@@ -247,7 +249,7 @@ func (s *Server) proxyResponsesViaAnthropic(
 		s.relayResponsesAnthropicStream(w, resp, r, incomingModel, targetModel, reqBody, start)
 		return
 	}
-	s.relayResponsesAnthropicJSON(w, resp, r, incomingModel, targetModel, in.Stream, reqBody, start)
+	s.relayResponsesAnthropicJSON(w, resp, r, incomingModel, targetModel, in.Stream, reqBody, start, cacheKey)
 }
 
 func (s *Server) relayResponsesAnthropicJSON(
@@ -258,6 +260,7 @@ func (s *Server) relayResponsesAnthropicJSON(
 	stream bool,
 	reqBody []byte,
 	start time.Time,
+	cacheKey string,
 ) {
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
@@ -274,6 +277,14 @@ func (s *Server) relayResponsesAnthropicJSON(
 			http.StatusBadGateway, msg, reqBody, time.Since(start))
 		return
 	}
+
+	// Store in response cache before processing (converted to OpenAI format).
+	if cacheKey != "" && !stream && resp.StatusCode == http.StatusOK {
+		if openAIBody, err := proxy.AnthropicToOpenAIJSON(raw); err == nil {
+			s.storeInCache(cacheKey, targetModel, openAIBody)
+		}
+	}
+
 	if resp.StatusCode >= http.StatusBadRequest {
 		message := extractAnthropicError(raw)
 		if message == "" {

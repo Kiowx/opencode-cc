@@ -200,3 +200,91 @@ func ParseOpenAIResponse(b []byte) (*OpenAIResponse, error) {
 	}
 	return &r, nil
 }
+
+// AnthropicToOpenAIJSON converts a native Anthropic Messages response body to
+// an OpenAI Chat Completions JSON body, suitable for local response-cache storage.
+func AnthropicToOpenAIJSON(raw []byte) ([]byte, error) {
+	var aresp AnthropicResponse
+	if err := json.Unmarshal(raw, &aresp); err != nil {
+		return nil, fmt.Errorf("decode anthropic response: %w", err)
+	}
+
+	var text, reasoning string
+	var toolCalls []OpenAIToolCall
+	for _, block := range aresp.Content {
+		switch block.Type {
+		case "text":
+			text += block.Text
+		case "thinking":
+			reasoning += block.Thinking
+		case "tool_use":
+			args := block.Input
+			if len(args) == 0 {
+				args = json.RawMessage(`{}`)
+			}
+			toolCalls = append(toolCalls, OpenAIToolCall{
+				ID:   block.ID,
+				Type: "function",
+				Function: OpenAIFunctionCall{
+					Name:      block.Name,
+					Arguments: string(args),
+				},
+			})
+		}
+	}
+
+	stopReason := ""
+	if aresp.StopReason != nil {
+		stopReason = *aresp.StopReason
+	}
+	finishReason := anthropicStopToFinish(stopReason, len(toolCalls) > 0)
+
+	msg := OpenAIMessage{
+		Role:    aresp.Role,
+		Content: text,
+	}
+	if reasoning != "" {
+		msg.ReasoningContent = reasoning
+	}
+	if len(toolCalls) > 0 {
+		msg.ToolCalls = toolCalls
+	}
+
+	out := OpenAIResponse{
+		ID: "msg_" + stripPrefix(aresp.ID),
+		Choices: []OpenAIChoice{{
+			Index:        0,
+			Message:      &msg,
+			FinishReason: &finishReason,
+		}},
+		Usage: OpenAIUsage{
+			PromptTokens:     aresp.Usage.InputTokens,
+			CompletionTokens: aresp.Usage.OutputTokens,
+		},
+	}
+	if aresp.Usage.CacheReadInputTokens > 0 {
+		out.Usage.PromptTokensDetails = &OpenAIPromptTokensDetails{
+			CachedTokens: aresp.Usage.CacheReadInputTokens,
+		}
+	}
+
+	return json.Marshal(out)
+}
+
+func anthropicStopToFinish(stop string, hasToolUse bool) string {
+	if hasToolUse && (stop == "" || stop == "end_turn") {
+		return "tool_calls"
+	}
+	switch stop {
+	case "end_turn":
+		return "stop"
+	case "max_tokens":
+		return "length"
+	case "tool_use":
+		return "tool_calls"
+	case "stop_sequence":
+		return "stop"
+	default:
+		return "stop"
+	}
+}

@@ -49,7 +49,7 @@ func (s *Server) tryServeFromCache(
 		}
 		s.logSuccessWithCache(r.Context(), r, inModel, target, false, http.StatusOK,
 			entry.PromptTokens, aresp.Usage.OutputTokens,
-			entry.PromptTokens, 0,
+			0, 0,
 			stop, string(reqBody), mustJSON(aresp), time.Since(start))
 		return true
 	}
@@ -64,7 +64,7 @@ func (s *Server) tryServeFromCache(
 		}
 		s.logSuccessWithCache(r.Context(), r, inModel, target, false, http.StatusOK,
 			entry.PromptTokens, oresp.Usage.CompletionTokens,
-			entry.PromptTokens, 0, stopReason,
+			0, 0, stopReason,
 			string(reqBody), string(entry.Body), time.Since(start))
 		return true
 	}
@@ -78,7 +78,7 @@ func (s *Server) tryServeFromCache(
 		}
 		s.logSuccessWithCache(r.Context(), r, inModel, target, false, http.StatusOK,
 			entry.PromptTokens, oresp.Usage.CompletionTokens,
-			entry.PromptTokens, 0, stopReason,
+			0, 0, stopReason,
 			string(reqBody), mustJSON(out), time.Since(start))
 		return true
 	}

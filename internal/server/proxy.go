@@ -53,29 +53,32 @@ func (s *Server) Proxy() http.HandlerFunc {
 
 		hasWebSearch := shouldUseWebSearchShim(&areq)
 		webSearchMode := cfg.ResolveWebSearchMode()
+
+		// Convert to OpenAI struct early — needed for cache key regardless of path.
+		oreq := proxy.ConvertRequest(&areq, func(string) string { return targetModel })
+		applyThinkingBudgetMapping(oreq, &areq, targetModel, cfg)
+		proxy.ApplyOpenAIPromptCache(oreq, promptCacheOptionsFromConfig(cfg))
+
+		// Attempt to serve from local response cache (non-streaming only).
+		if !areq.Stream && s.tryServeFromCache(w, r, oreq.PromptCacheKey, areq.Model,
+			targetModel, false, string(body), r.URL.Path, start) {
+			return
+		}
+
 		if hasWebSearch && webSearchMode == cfgpkg.WebSearchModeNative {
 			searchUpstream, searchKey := cfg.ResolveWebSearchUpstream(upstream, zenKey)
 			searchModel := cfg.ResolveWebSearchModel(targetModel)
-			s.proxyNativeAnthropic(w, r, body, &areq, searchUpstream, searchKey, searchModel, timeoutSeconds, start)
+			s.proxyNativeAnthropic(w, r, body, &areq, searchUpstream, searchKey, searchModel, timeoutSeconds, start, oreq.PromptCacheKey)
 			return
 		}
 
 		if nativeAnthropic && proxy.IsNativeAnthropicModel(targetModel) &&
 			!(hasWebSearch && webSearchMode == cfgpkg.WebSearchModeTranslate) {
-			s.proxyNativeAnthropic(w, r, body, &areq, upstream, zenKey, targetModel, timeoutSeconds, start)
+			s.proxyNativeAnthropic(w, r, body, &areq, upstream, zenKey, targetModel, timeoutSeconds, start, oreq.PromptCacheKey)
 			return
 		}
 
-		oreq := proxy.ConvertRequest(&areq, func(string) string { return targetModel })
-		applyThinkingBudgetMapping(oreq, &areq, targetModel, cfg)
-		proxy.ApplyOpenAIPromptCache(oreq, promptCacheOptionsFromConfig(cfg))
 		if s.handleWebSearchShim(w, r, body, &areq, oreq, upstream, zenKey, targetModel, cfg, timeoutSeconds, start) {
-			return
-		}
-
-		// Attempt to serve from local response cache (non-streaming only).
-		if !areq.Stream && s.tryServeFromCache(w, r, oreq.PromptCacheKey, areq.Model,
-			targetModel, false, string(body), r.URL.Path, start) {
 			return
 		}
 
@@ -166,6 +169,7 @@ func (s *Server) proxyNativeAnthropic(
 	upstream, zenKey, targetModel string,
 	timeoutSeconds int,
 	start time.Time,
+	cacheKey string,
 ) {
 	upBody, err := proxy.PrepareAnthropicPromptCacheBody(body, targetModel, promptCacheOptionsFromConfig(s.cfg.Snapshot()))
 	if err != nil {
@@ -239,7 +243,7 @@ func (s *Server) proxyNativeAnthropic(
 		s.relayNativeAnthropicStream(w, resp, r, areq.Model, targetModel, body, start)
 		return
 	}
-	s.relayNativeAnthropicJSON(w, resp, r, areq.Model, targetModel, areq.Stream, body, start)
+	s.relayNativeAnthropicJSON(w, resp, r, areq.Model, targetModel, areq.Stream, body, start, cacheKey)
 }
 
 func (s *Server) relayNativeAnthropicJSON(
@@ -250,6 +254,7 @@ func (s *Server) relayNativeAnthropicJSON(
 	stream bool,
 	reqBody []byte,
 	start time.Time,
+	cacheKey string,
 ) {
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
@@ -263,6 +268,13 @@ func (s *Server) relayNativeAnthropicJSON(
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", msg)
 		s.logFailed(r.Context(), r, inModel, target, stream, http.StatusBadGateway, msg, reqBody, time.Since(start))
 		return
+	}
+
+	// Store in response cache before writing the response.
+	if cacheKey != "" && !stream && resp.StatusCode == http.StatusOK {
+		if openAIBody, err := proxy.AnthropicToOpenAIJSON(raw); err == nil {
+			s.storeInCache(cacheKey, target, openAIBody)
+		}
 	}
 
 	copyOpenAIHeaders(w.Header(), resp.Header, false)
@@ -459,7 +471,9 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, resp *http.Respo
 		return
 	}
 	// Store in response cache before parsing (so we cache the raw upstream body).
-	s.storeInCache(cacheKey, target, raw)
+	if resp.StatusCode == http.StatusOK {
+		s.storeInCache(cacheKey, target, raw)
+	}
 	oresp, err := proxy.ParseOpenAIResponse(raw)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "could not parse upstream response: "+err.Error())
