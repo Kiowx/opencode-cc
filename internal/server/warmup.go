@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"math/rand"
@@ -18,6 +20,8 @@ import (
 // warmupCache sends the configured warmup prompts to the upstream and stores
 // the responses in the local response cache under both the raw-map key
 // (matches OpenAIProxy) and the struct key (matches Proxy/ResponsesProxy).
+// Requests use stream=true to match real codex traffic and prime the
+// upstream prompt cache with a matching request format.
 func (s *Server) warmupCache(ctx context.Context) {
 	cfg := s.cfg.Snapshot()
 	if !cfg.ResponseCacheWarmupEnabled || len(cfg.ResponseCacheWarmupPrompts) == 0 {
@@ -30,8 +34,6 @@ func (s *Server) warmupCache(ctx context.Context) {
 	const maxRetries = 3
 	backoffBase := []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second}
 
-	opts := promptCacheOptionsFromConfig(cfg)
-
 	for i, wp := range cfg.ResponseCacheWarmupPrompts {
 		if wp.Model == "" || wp.UserMessage == "" {
 			continue
@@ -39,20 +41,10 @@ func (s *Server) warmupCache(ctx context.Context) {
 		targetModel := cfg.ResolveModel(wp.Model)
 
 		payload := buildWarmupPayload(targetModel, &wp)
-		proxy.ApplyRawOpenAIPromptCache(payload, opts)
-		cacheKeyRaw := rawString(payload["prompt_cache_key"])
 
 		body, err := json.Marshal(payload)
 		if err != nil {
 			continue
-		}
-
-		var cacheKeyStruct string
-		var oreq proxy.OpenAIRequest
-		if json.Unmarshal(body, &oreq) == nil {
-			oreq.PromptCacheKey = ""
-			proxy.ApplyOpenAIPromptCache(&oreq, opts)
-			cacheKeyStruct = oreq.PromptCacheKey
 		}
 
 		cached := false
@@ -70,7 +62,7 @@ func (s *Server) warmupCache(ctx context.Context) {
 			}
 			upReq.Header.Set("Authorization", "Bearer "+zenKey)
 			upReq.Header.Set("Content-Type", "application/json")
-			upReq.Header.Set("Accept", "application/json")
+			upReq.Header.Set("Accept", "text/event-stream")
 
 			resp, err := s.httpClient.Do(upReq)
 			if err != nil {
@@ -97,31 +89,22 @@ func (s *Server) warmupCache(ctx context.Context) {
 				break
 			}
 
-			raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+			// Read the SSE stream and reconstruct a full OpenAI response.
+			reconstructedBody, promptTokens, parseErr := readSSEToFullResponse(resp.Body)
 			resp.Body.Close()
-			if err != nil || len(raw) > maxResponseBytes {
-				log.Printf("warmup: request %d read error: %v", i, err)
-				break
+			if parseErr != nil {
+				log.Printf("warmup: request %d parse error: %v", i, parseErr)
+				if attempt < maxRetries {
+					time.Sleep(backoffBase[attempt] + time.Duration(rand.Intn(500))*time.Millisecond)
+				}
+				continue
 			}
 
-			var usage struct {
-				PromptTokens int `json:"prompt_tokens"`
-			}
-			var respEnvelope struct {
-				Usage json.RawMessage `json:"usage"`
-			}
-			if json.Unmarshal(raw, &respEnvelope) == nil && len(respEnvelope.Usage) > 0 {
-				json.Unmarshal(respEnvelope.Usage, &usage)
-			}
-
-			s.responseCache.Set(cacheKeyRaw, targetModel, usage.PromptTokens, raw)
-			log.Printf("warmup: request %d cached raw=%s tokens=%d", i, cacheKeyRaw[:16], usage.PromptTokens)
+			ck := responseCacheKey(body)
+			s.responseCache.Set(ck, targetModel, promptTokens, reconstructedBody)
+			s.persistEntryToStore(ck, targetModel, promptTokens, reconstructedBody)
+			log.Printf("warmup: request %d cached key=%s tokens=%d", i, ck[:16], promptTokens)
 			cached = true
-
-			if cacheKeyStruct != "" && cacheKeyStruct != cacheKeyRaw {
-				s.responseCache.Set(cacheKeyStruct, targetModel, usage.PromptTokens, raw)
-				log.Printf("warmup: request %d cached struct=%s", i, cacheKeyStruct[:16])
-			}
 			break
 		}
 		if !cached {
@@ -133,11 +116,132 @@ func (s *Server) warmupCache(ctx context.Context) {
 	log.Printf("warmup: done")
 }
 
+// readSSEToFullResponse reads an SSE stream from r, parsing line-by-line
+// until it sees [DONE] (the upstream never closes the connection on keep-alive).
+// It extracts the last data chunk with usage and reconstructs a full
+// non-streaming OpenAI chat completion response for cache storage.
+func readSSEToFullResponse(r io.Reader) ([]byte, int, error) {
+	var (
+		id, model      string
+		created        int64
+		finishReason   string
+		contentBuilder strings.Builder
+		lastUsage      *proxy.OpenAIUsage
+		totalRead      int64
+	)
+
+	br := bufio.NewReader(r)
+	for {
+		line, err := br.ReadBytes('\n')
+		if err != nil {
+			// If we already got usage and the stream ended, that's fine.
+			if lastUsage != nil && err == io.EOF {
+				break
+			}
+			return nil, 0, fmt.Errorf("read SSE line: %w", err)
+		}
+		totalRead += int64(len(line))
+		if totalRead > maxResponseBytes {
+			return nil, 0, fmt.Errorf("SSE body exceeds max response size")
+		}
+
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		data := bytes.TrimSpace(line[6:])
+		if len(data) == 0 {
+			continue
+		}
+		if string(data) == "[DONE]" {
+			break
+		}
+
+		var rawChunk map[string]json.RawMessage
+		if err := json.Unmarshal(data, &rawChunk); err != nil {
+			continue
+		}
+
+		// Extract id, model, created from the first chunk that has them.
+		if v, ok := rawChunk["id"]; ok && len(v) > 0 && id == "" {
+			json.Unmarshal(v, &id)
+		}
+		if v, ok := rawChunk["model"]; ok && len(v) > 0 && model == "" {
+			json.Unmarshal(v, &model)
+		}
+		if v, ok := rawChunk["created"]; ok && len(v) > 0 && created == 0 {
+			json.Unmarshal(v, &created)
+		}
+
+		// Use the struct-based chunk for structured fields.
+		var chunk proxy.OpenAIStreamChunk
+		if json.Unmarshal(data, &chunk) != nil {
+			continue
+		}
+
+		for _, choice := range chunk.Choices {
+			if choice.Delta.Content != "" {
+				contentBuilder.WriteString(choice.Delta.Content)
+			}
+			if choice.FinishReason != nil {
+				finishReason = *choice.FinishReason
+			}
+		}
+
+		if chunk.Usage != nil {
+			lastUsage = chunk.Usage
+		}
+	}
+
+	if lastUsage == nil {
+		return nil, 0, fmt.Errorf("no usage found in SSE stream")
+	}
+	if finishReason == "" {
+		finishReason = "stop"
+	}
+	if id == "" {
+		id = "chatcmpl-warmup"
+	}
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+
+	resp := proxy.OpenAIResponse{
+		ID: id,
+		Choices: []proxy.OpenAIChoice{
+			{
+				Index: 0,
+				Message: &proxy.OpenAIMessage{
+					Role:    "assistant",
+					Content: contentBuilder.String(),
+				},
+				FinishReason: &finishReason,
+			},
+		},
+		Usage: *lastUsage,
+	}
+
+	bodyMap := map[string]any{
+		"id":      resp.ID,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   model,
+		"choices": resp.Choices,
+		"usage":   resp.Usage,
+	}
+	body, err := json.Marshal(bodyMap)
+	if err != nil {
+		return nil, 0, fmt.Errorf("marshal reconstructed response: %w", err)
+	}
+
+	return body, lastUsage.PromptTokens, nil
+}
+
 func buildWarmupPayload(model string, wp *config.WarmupPrompt) map[string]json.RawMessage {
 	payload := map[string]json.RawMessage{
 		"model":      json.RawMessage(`"` + jsonEscape(model) + `"`),
 		"max_tokens": json.RawMessage(`1`),
-		"stream":     json.RawMessage(`false`),
+		"stream":     json.RawMessage(`true`),
 	}
 	if len(wp.Tools) > 0 {
 		raw, _ := json.Marshal(wp.Tools)

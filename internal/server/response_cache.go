@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -11,11 +14,16 @@ import (
 	"github.com/Kiowx/opencode-cc/internal/proxy"
 )
 
+func responseCacheKey(body []byte) string {
+	h := sha256.Sum256(body)
+	return hex.EncodeToString(h[:])
+}
+
 const cacheStoreCleanupInterval = 5 * time.Minute
 
 // tryServeFromCache checks the response cache for the given cacheKey and, if
-// found, writes the cached response (in Anthropic wire format) to w. It returns
-// true when the request was fully satisfied from cache.
+// found, writes the cached response to w (as JSON for non-streaming, SSE for
+// streaming). It returns true when the request was fully satisfied from cache.
 func (s *Server) tryServeFromCache(
 	w http.ResponseWriter, r *http.Request,
 	cacheKey string,
@@ -24,7 +32,7 @@ func (s *Server) tryServeFromCache(
 	reqBody, path string,
 	start time.Time,
 ) bool {
-	if cacheKey == "" || stream {
+	if cacheKey == "" {
 		return false
 	}
 	entry, ok := s.responseCache.Get(cacheKey)
@@ -38,52 +46,245 @@ func (s *Server) tryServeFromCache(
 		return false
 	}
 
-	log.Printf("cache HIT  key=%s model=%s path=%s tokens=%d", cacheKey[:min(len(cacheKey), 24)], target, path, entry.PromptTokens)
+	log.Printf("cache HIT  key=%s model=%s path=%s tokens=%d stream=%v", cacheKey[:min(len(cacheKey), 24)], target, path, entry.PromptTokens, stream)
 
 	if strings.HasPrefix(path, "/v1/messages") {
 		aresp := proxy.ConvertResponse(oresp, inModel)
-		writeJSON(w, http.StatusOK, aresp)
+		if stream {
+			s.writeAnthropicStreamFromCache(w, oresp, aresp)
+		} else {
+			writeJSON(w, http.StatusOK, aresp)
+		}
 		stop := ""
 		if aresp.StopReason != nil {
 			stop = *aresp.StopReason
 		}
-		s.logSuccessWithCache(r.Context(), r, inModel, target, false, http.StatusOK,
+		s.logSuccessWithCache(r.Context(), r, inModel, target, stream, http.StatusOK,
 			entry.PromptTokens, aresp.Usage.OutputTokens,
-			0, 0,
+			entry.PromptTokens, 0,
 			stop, string(reqBody), mustJSON(aresp), time.Since(start))
 		return true
 	}
 
 	if strings.HasPrefix(path, "/v1/chat/completions") {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(entry.Body)
+		if stream {
+			s.writeOpenAIStreamFromCache(w, oresp, r)
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(entry.Body)
+		}
 		stopReason := ""
 		if len(oresp.Choices) > 0 && oresp.Choices[0].FinishReason != nil {
 			stopReason = *oresp.Choices[0].FinishReason
 		}
-		s.logSuccessWithCache(r.Context(), r, inModel, target, false, http.StatusOK,
+		s.logSuccessWithCache(r.Context(), r, inModel, target, stream, http.StatusOK,
 			entry.PromptTokens, oresp.Usage.CompletionTokens,
-			0, 0, stopReason,
+			entry.PromptTokens, 0, stopReason,
 			string(reqBody), string(entry.Body), time.Since(start))
 		return true
 	}
 
 	if strings.HasPrefix(path, "/v1/responses") {
 		out := proxy.ConvertResponsesResponse(oresp, inModel)
-		writeJSON(w, http.StatusOK, out)
+		if stream {
+			s.writeResponsesStreamFromCache(w, out, oresp)
+		} else {
+			writeJSON(w, http.StatusOK, out)
+		}
 		stopReason := ""
 		if len(oresp.Choices) > 0 && oresp.Choices[0].FinishReason != nil {
 			stopReason = *oresp.Choices[0].FinishReason
 		}
-		s.logSuccessWithCache(r.Context(), r, inModel, target, false, http.StatusOK,
+		s.logSuccessWithCache(r.Context(), r, inModel, target, stream, http.StatusOK,
 			entry.PromptTokens, oresp.Usage.CompletionTokens,
-			0, 0, stopReason,
+			entry.PromptTokens, 0, stopReason,
 			string(reqBody), mustJSON(out), time.Since(start))
 		return true
 	}
 
 	return false
+}
+
+// writeOpenAIStreamFromCache writes a cached non-streaming OpenAI Response as
+// SSE chunks, pretending to be a streaming response from the upstream.
+func (s *Server) writeOpenAIStreamFromCache(w http.ResponseWriter, oresp *proxy.OpenAIResponse, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	content := ""
+	finishReason := "stop"
+	if len(oresp.Choices) > 0 {
+		if oresp.Choices[0].Message != nil {
+			content, _ = oresp.Choices[0].Message.Content.(string)
+		}
+		if oresp.Choices[0].FinishReason != nil {
+			finishReason = *oresp.Choices[0].FinishReason
+		}
+	}
+
+	// Chunk 1: full content with finish_reason (no usage).
+	chunk1 := map[string]any{
+		"id":      oresp.ID,
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   oresp.ID,
+		"choices": []map[string]any{{
+			"index":         0,
+			"delta":         map[string]any{"role": "assistant", "content": content},
+			"finish_reason": finishReason,
+		}},
+		"usage": nil,
+	}
+	b1, _ := json.Marshal(chunk1)
+	fmt.Fprintf(w, "data: %s\n\n", b1)
+	flusher.Flush()
+
+	// Chunk 2: empty choices with final usage.
+	chunk2 := map[string]any{
+		"id":      oresp.ID,
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   oresp.ID,
+		"choices": []map[string]any{},
+		"usage":   oresp.Usage,
+	}
+	b2, _ := json.Marshal(chunk2)
+	fmt.Fprintf(w, "data: %s\n\n", b2)
+	flusher.Flush()
+
+	// End signal.
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+// writeAnthropicStreamFromCache writes a cached response as Anthropic SSE
+// events. For simplicity, sends message_start → content_block_start →
+// content_block_delta → content_block_stop → message_delta → message_stop.
+func (s *Server) writeAnthropicStreamFromCache(w http.ResponseWriter, oresp *proxy.OpenAIResponse, aresp *proxy.AnthropicResponse) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("anthropic-version", "2023-06-01")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	text := ""
+	for _, block := range aresp.Content {
+		if block.Type == "text" {
+			text = block.Text
+			break
+		}
+	}
+	msgID := aresp.ID
+	stopReason := ""
+	if aresp.StopReason != nil {
+		stopReason = *aresp.StopReason
+	}
+
+	// message_start
+	msgStart := map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id":      msgID,
+			"type":    "message",
+			"role":    "assistant",
+			"content": []map[string]any{},
+			"model":   aresp.Model,
+			"stop_reason": nil,
+			"stop_sequence": nil,
+			"usage":   aresp.Usage,
+		},
+	}
+	b, _ := json.Marshal(msgStart)
+	fmt.Fprintf(w, "event: message_start\ndata: %s\n\n", b)
+	flusher.Flush()
+
+	// content_block_start
+	cbStart := map[string]any{
+		"type":  "content_block_start",
+		"index": 0,
+		"content_block": map[string]any{
+			"type": "text",
+			"text": text,
+		},
+	}
+	b, _ = json.Marshal(cbStart)
+	fmt.Fprintf(w, "event: content_block_start\ndata: %s\n\n", b)
+	flusher.Flush()
+
+	// content_block_stop
+	cbStop := map[string]any{"type": "content_block_stop", "index": 0}
+	b, _ = json.Marshal(cbStop)
+	fmt.Fprintf(w, "event: content_block_stop\ndata: %s\n\n", b)
+	flusher.Flush()
+
+	// message_delta
+	msgDelta := map[string]any{
+		"type": "message_delta",
+		"delta": map[string]any{
+			"stop_reason":   stopReason,
+			"stop_sequence": nil,
+		},
+		"usage": map[string]any{
+			"output_tokens": aresp.Usage.OutputTokens,
+		},
+	}
+	b, _ = json.Marshal(msgDelta)
+	fmt.Fprintf(w, "event: message_delta\ndata: %s\n\n", b)
+	flusher.Flush()
+
+	// message_stop
+	fmt.Fprintf(w, "event: message_stop\ndata: {}\n\n")
+	flusher.Flush()
+}
+
+// writeResponsesStreamFromCache writes a cached Responses API response as SSE
+// chunks. Uses OpenAI SSE format (the Responses stream converter handles it).
+func (s *Server) writeResponsesStreamFromCache(w http.ResponseWriter, resp *proxy.ResponsesResponse, oresp *proxy.OpenAIResponse) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	converter, err := proxy.NewResponsesStreamConverter(w, resp.Model)
+	if err != nil {
+		return
+	}
+
+	content := ""
+	finishReason := "stop"
+	if len(oresp.Choices) > 0 {
+		if oresp.Choices[0].Message != nil {
+			content, _ = oresp.Choices[0].Message.Content.(string)
+		}
+		if oresp.Choices[0].FinishReason != nil {
+			finishReason = *oresp.Choices[0].FinishReason
+		}
+	}
+
+	converter.HandleTextDelta(content)
+	converter.SetUsage(oresp.Usage.PromptTokens, oresp.Usage.CompletionTokens)
+	converter.SetCachedInputTokens(oresp.Usage.CachedPromptTokens())
+	converter.SetFinishReason(finishReason)
+	_ = converter.Finalize()
+	flusher.Flush()
 }
 
 // storeInCache saves an upstream OpenAI-compatible response body in the

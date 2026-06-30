@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
@@ -33,15 +34,17 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 			return
 		}
 
-		upBody, incomingModel, targetModel, stream, cacheKey, err := s.prepareOpenAIRequest(body)
+		upBody, incomingModel, targetModel, stream, _, err := s.prepareOpenAIRequest(body)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
 
-		// Attempt to serve from local response cache (non-streaming only).
-		if !stream && s.tryServeFromCache(w, r, cacheKey, incomingModel,
-			targetModel, false, string(body), r.URL.Path, start) {
+		rcKey := responseCacheKey(upBody)
+
+		// Attempt to serve from local response cache.
+		if s.tryServeFromCache(w, r, rcKey, incomingModel,
+			targetModel, stream, string(body), r.URL.Path, start) {
 			return
 		}
 
@@ -118,10 +121,10 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 		if stream && resp.StatusCode < http.StatusBadRequest &&
 			(contentType == "" || strings.Contains(contentType, "text/event-stream")) {
-			s.relayOpenAIStream(w, resp, r, incomingModel, targetModel, body, start)
+			s.relayOpenAIStream(w, resp, r, incomingModel, targetModel, body, start, rcKey)
 			return
 		}
-		s.relayOpenAIJSON(w, resp, r, incomingModel, targetModel, stream, body, start, cacheKey)
+		s.relayOpenAIJSON(w, resp, r, incomingModel, targetModel, stream, body, start, rcKey)
 	}
 }
 
@@ -241,6 +244,7 @@ func (s *Server) relayOpenAIStream(
 	incomingModel, targetModel string,
 	reqBody []byte,
 	start time.Time,
+	cacheKey string,
 ) {
 	defer resp.Body.Close()
 
@@ -269,10 +273,12 @@ func (s *Server) relayOpenAIStream(
 
 	var responseLog strings.Builder
 	relay := &openAIStreamRelay{
-		dst:      w,
-		flusher:  flusher,
-		log:      &responseLog,
-		logLimit: s.cfg.Snapshot().MaxBodyLogBytes,
+		dst:         w,
+		flusher:     flusher,
+		log:         &responseLog,
+		logLimit:    s.cfg.Snapshot().MaxBodyLogBytes,
+		cacheKey:    cacheKey,
+		targetModel: targetModel,
 	}
 	if _, err := io.Copy(relay, reader); err != nil {
 		errPayload, _ := json.Marshal(map[string]any{
@@ -288,14 +294,21 @@ func (s *Server) relayOpenAIStream(
 		return
 	}
 
+	// After stream completes, reconstruct a full response from buffered SSE
+	// chunks and store in cache so subsequent identical streaming requests
+	// are served instantly from cache.
+	if resp.StatusCode == http.StatusOK && cacheKey != "" {
+		relay.cacheResponse(s)
+	}
+
 	s.logSuccessWithCache(r.Context(), r, incomingModel, targetModel, true, resp.StatusCode,
 		relay.inputTokens, relay.outputTokens, relay.cachedInputTokens, 0, relay.stopReason,
 		string(reqBody), responseLog.String(), time.Since(start))
 }
 
 // openAIStreamRelay writes upstream bytes directly to the client and flushes
-// every write. It only observes complete SSE data lines for usage logging; it
-// never re-encodes or otherwise changes the native OpenAI stream.
+// every write. It observes complete SSE data lines for usage logging and
+// buffers them for cache reconstruction after the stream ends.
 type openAIStreamRelay struct {
 	dst      io.Writer
 	flusher  http.Flusher
@@ -307,6 +320,108 @@ type openAIStreamRelay struct {
 	outputTokens      int
 	cachedInputTokens int
 	stopReason        string
+
+	// Cache fields: set by relayOpenAIStream before streaming.
+	cacheKey    string
+	targetModel string
+	// dataBuf accumulates the JSON payload of each SSE data: line (without
+	// the "data: " prefix or trailing newline), one per line.
+	dataBuf bytes.Buffer
+}
+
+// cacheResponse reconstructs a full non-streaming OpenAI response from the
+// buffered SSE data chunks and stores it in the server's response cache.
+func (r *openAIStreamRelay) cacheResponse(s *Server) {
+	if r.cacheKey == "" || r.dataBuf.Len() == 0 {
+		return
+	}
+	body := r.reconstructFullResponse()
+	if body == nil {
+		return
+	}
+	s.storeInCache(r.cacheKey, r.targetModel, body)
+}
+
+// reconstructFullResponse parses all buffered SSE data payloads and builds a
+// single non-streaming OpenAI Response JSON, suitable for cache storage.
+func (r *openAIStreamRelay) reconstructFullResponse() []byte {
+	var (
+		id, model string
+		created   int64
+		finishReason string
+		contentBuilder strings.Builder
+		lastUsage *proxy.OpenAIUsage
+	)
+
+	scanner := bufio.NewScanner(&r.dataBuf)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var rawChunk map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &rawChunk); err != nil {
+			continue
+		}
+		if v, ok := rawChunk["id"]; ok && len(v) > 0 && id == "" {
+			json.Unmarshal(v, &id)
+		}
+		if v, ok := rawChunk["model"]; ok && len(v) > 0 && model == "" {
+			json.Unmarshal(v, &model)
+		}
+		if v, ok := rawChunk["created"]; ok && len(v) > 0 && created == 0 {
+			json.Unmarshal(v, &created)
+		}
+
+		var chunk proxy.OpenAIStreamChunk
+		if json.Unmarshal([]byte(line), &chunk) != nil {
+			continue
+		}
+		for _, choice := range chunk.Choices {
+			if choice.Delta.Content != "" {
+				contentBuilder.WriteString(choice.Delta.Content)
+			}
+			if choice.FinishReason != nil {
+				finishReason = *choice.FinishReason
+			}
+		}
+		if chunk.Usage != nil {
+			lastUsage = chunk.Usage
+		}
+	}
+
+	if lastUsage == nil {
+		return nil
+	}
+	if finishReason == "" {
+		finishReason = "stop"
+	}
+	if id == "" {
+		id = "chatcmpl-stream"
+	}
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+
+	respMap := map[string]any{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{{
+			"index": 0,
+			"message": map[string]any{
+				"role":    "assistant",
+				"content": contentBuilder.String(),
+			},
+			"finish_reason": finishReason,
+			"logprobs":      nil,
+		}},
+		"usage": lastUsage,
+	}
+	body, _ := json.Marshal(respMap)
+	return body
 }
 
 func (r *openAIStreamRelay) Write(p []byte) (int, error) {
@@ -348,6 +463,11 @@ func (r *openAIStreamRelay) observe(p []byte) {
 			if choice.FinishReason != nil {
 				r.stopReason = *choice.FinishReason
 			}
+		}
+		// Buffer the data line for cache reconstruction.
+		if r.cacheKey != "" {
+			r.dataBuf.WriteString(data)
+			r.dataBuf.WriteByte('\n')
 		}
 	}
 }

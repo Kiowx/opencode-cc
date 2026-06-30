@@ -60,14 +60,16 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 		applyResponsesThinkingMapping(chatReq, targetModel, cfg)
 		proxy.ApplyOpenAIPromptCache(chatReq, promptCacheOptionsFromConfig(cfg))
 
-		// Attempt to serve from local response cache (non-streaming only).
-		if !in.Stream && s.tryServeFromCache(w, r, chatReq.PromptCacheKey, incomingModel,
-			targetModel, false, string(body), r.URL.Path, start) {
+		rcKey := responseCacheKey(body)
+
+		// Attempt to serve from local response cache.
+		if s.tryServeFromCache(w, r, rcKey, incomingModel,
+			targetModel, in.Stream, string(body), r.URL.Path, start) {
 			return
 		}
 
 		if cfg.NativeAnthropic && proxy.IsNativeAnthropicModel(targetModel) {
-			s.proxyResponsesViaAnthropic(w, r, in, cfg, upstream, zenKey, incomingModel, targetModel, body, start, chatReq.PromptCacheKey)
+			s.proxyResponsesViaAnthropic(w, r, in, cfg, upstream, zenKey, incomingModel, targetModel, body, start, rcKey)
 			return
 		}
 
@@ -141,10 +143,10 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 		if in.Stream && resp.StatusCode < http.StatusBadRequest &&
 			(contentType == "" || strings.Contains(contentType, "text/event-stream")) {
-			s.relayResponsesStream(w, resp, r, incomingModel, targetModel, body, start)
+			s.relayResponsesStream(w, resp, r, incomingModel, targetModel, body, start, rcKey)
 			return
 		}
-		s.relayResponsesJSON(w, resp, r, incomingModel, targetModel, in.Stream, body, start, chatReq.PromptCacheKey)
+		s.relayResponsesJSON(w, resp, r, incomingModel, targetModel, in.Stream, body, start, rcKey)
 	}
 }
 
@@ -246,7 +248,7 @@ func (s *Server) proxyResponsesViaAnthropic(
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	if in.Stream && resp.StatusCode < http.StatusBadRequest &&
 		(contentType == "" || strings.Contains(contentType, "text/event-stream")) {
-		s.relayResponsesAnthropicStream(w, resp, r, incomingModel, targetModel, reqBody, start)
+		s.relayResponsesAnthropicStream(w, resp, r, incomingModel, targetModel, reqBody, start, cacheKey)
 		return
 	}
 	s.relayResponsesAnthropicJSON(w, resp, r, incomingModel, targetModel, in.Stream, reqBody, start, cacheKey)
@@ -395,6 +397,7 @@ func (s *Server) relayResponsesStream(
 	incomingModel, targetModel string,
 	reqBody []byte,
 	start time.Time,
+	cacheKey string,
 ) {
 	defer resp.Body.Close()
 	flusher, ok := w.(http.Flusher)
@@ -421,6 +424,7 @@ func (s *Server) relayResponsesStream(
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
+	var chunks []*proxy.OpenAIStreamChunk
 	responseLog := &limitedLogWriter{limit: s.cfg.Snapshot().MaxBodyLogBytes}
 	converter, err := proxy.NewResponsesStreamConverter(io.MultiWriter(w, responseLog), incomingModel)
 	if err != nil {
@@ -431,6 +435,9 @@ func (s *Server) relayResponsesStream(
 	flusher.Flush()
 
 	scanResult, scanErr := proxy.ScanOpenAIStreamWithStatus(reader, func(chunk *proxy.OpenAIStreamChunk) error {
+		if cacheKey != "" {
+			chunks = append(chunks, chunk)
+		}
 		if err := converter.HandleChunk(chunk); err != nil {
 			return err
 		}
@@ -459,6 +466,11 @@ func (s *Server) relayResponsesStream(
 	}
 	flusher.Flush()
 
+	// Cache the reconstructed response.
+	if cacheKey != "" && len(chunks) > 0 {
+		s.cacheOpenAIChunks(cacheKey, targetModel, chunks)
+	}
+
 	s.logSuccessWithCache(r.Context(), r, incomingModel, targetModel, true, http.StatusOK,
 		converter.InputTokens(), converter.OutputTokens(), converter.CachedInputTokens(), 0,
 		converter.FinishReason(),
@@ -472,6 +484,7 @@ func (s *Server) relayResponsesAnthropicStream(
 	incomingModel, targetModel string,
 	reqBody []byte,
 	start time.Time,
+	cacheKey string,
 ) {
 	defer resp.Body.Close()
 	flusher, ok := w.(http.Flusher)
@@ -510,6 +523,7 @@ func (s *Server) relayResponsesAnthropicStream(
 	var inputTokens, outputTokens int
 	var cachedInputTokens, cacheCreationInputTokens int
 	var sawAnthropicStop bool
+	var chunks []*proxy.OpenAIStreamChunk
 	scanErr := scanAnthropicSSE(reader, func(event string, data []byte) error {
 		var payload struct {
 			Type    string `json:"type"`
@@ -563,19 +577,15 @@ func (s *Server) relayResponsesAnthropicStream(
 			switch payload.ContentBlock.Type {
 			case "text":
 				if payload.ContentBlock.Text != "" {
-					if err := converter.HandleTextDelta(payload.ContentBlock.Text); err != nil {
-						return err
-					}
+					converter.HandleTextDelta(payload.ContentBlock.Text)
 				}
 			case "tool_use":
-				if err := converter.HandleFunctionCallDelta(
+				converter.HandleFunctionCallDelta(
 					payload.Index,
 					payload.ContentBlock.ID,
 					payload.ContentBlock.Name,
 					"",
-				); err != nil {
-					return err
-				}
+				)
 			}
 		case "content_block_delta":
 			if payload.Delta == nil {
@@ -583,13 +593,9 @@ func (s *Server) relayResponsesAnthropicStream(
 			}
 			switch payload.Delta.Type {
 			case "text_delta":
-				if err := converter.HandleTextDelta(payload.Delta.Text); err != nil {
-					return err
-				}
+				converter.HandleTextDelta(payload.Delta.Text)
 			case "input_json_delta":
-				if err := converter.HandleFunctionCallDelta(payload.Index, "", "", payload.Delta.PartialJSON); err != nil {
-					return err
-				}
+				converter.HandleFunctionCallDelta(payload.Index, "", "", payload.Delta.PartialJSON)
 			}
 		case "message_delta":
 			if payload.Usage != nil {
@@ -602,6 +608,13 @@ func (s *Server) relayResponsesAnthropicStream(
 			}
 		case "message_stop":
 			sawAnthropicStop = true
+		}
+		// Buffer raw SSE data for cache reconstruction.
+		if cacheKey != "" && len(data) > 0 {
+			var rawChunk map[string]json.RawMessage
+			if json.Unmarshal(data, &rawChunk) == nil {
+				chunks = append(chunks, &proxy.OpenAIStreamChunk{ID: rawString(rawChunk["id"])})
+			}
 		}
 		flusher.Flush()
 		return nil
@@ -627,6 +640,11 @@ func (s *Server) relayResponsesAnthropicStream(
 		return
 	}
 	flusher.Flush()
+
+	// Cache the reconstructed response.
+	if cacheKey != "" && len(chunks) > 0 {
+		s.cacheOpenAIChunks(cacheKey, targetModel, chunks)
+	}
 
 	s.logSuccessWithCache(r.Context(), r, incomingModel, targetModel, true, http.StatusOK,
 		converter.InputTokens(), converter.OutputTokens(), cachedInputTokens, cacheCreationInputTokens,

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -59,22 +60,24 @@ func (s *Server) Proxy() http.HandlerFunc {
 		applyThinkingBudgetMapping(oreq, &areq, targetModel, cfg)
 		proxy.ApplyOpenAIPromptCache(oreq, promptCacheOptionsFromConfig(cfg))
 
-		// Attempt to serve from local response cache (non-streaming only).
-		if !areq.Stream && s.tryServeFromCache(w, r, oreq.PromptCacheKey, areq.Model,
-			targetModel, false, string(body), r.URL.Path, start) {
+		rcKey := responseCacheKey(body)
+
+		// Attempt to serve from local response cache.
+		if s.tryServeFromCache(w, r, rcKey, areq.Model,
+			targetModel, areq.Stream, string(body), r.URL.Path, start) {
 			return
 		}
 
 		if hasWebSearch && webSearchMode == cfgpkg.WebSearchModeNative {
 			searchUpstream, searchKey := cfg.ResolveWebSearchUpstream(upstream, zenKey)
 			searchModel := cfg.ResolveWebSearchModel(targetModel)
-			s.proxyNativeAnthropic(w, r, body, &areq, searchUpstream, searchKey, searchModel, timeoutSeconds, start, oreq.PromptCacheKey)
+			s.proxyNativeAnthropic(w, r, body, &areq, searchUpstream, searchKey, searchModel, timeoutSeconds, start, rcKey)
 			return
 		}
 
 		if nativeAnthropic && proxy.IsNativeAnthropicModel(targetModel) &&
 			!(hasWebSearch && webSearchMode == cfgpkg.WebSearchModeTranslate) {
-			s.proxyNativeAnthropic(w, r, body, &areq, upstream, zenKey, targetModel, timeoutSeconds, start, oreq.PromptCacheKey)
+			s.proxyNativeAnthropic(w, r, body, &areq, upstream, zenKey, targetModel, timeoutSeconds, start, rcKey)
 			return
 		}
 
@@ -154,9 +157,9 @@ func (s *Server) Proxy() http.HandlerFunc {
 		}
 
 		if areq.Stream {
-			s.handleStreamResponse(w, resp, r, areq.Model, targetModel, body, start)
+			s.handleStreamResponse(w, resp, r, areq.Model, targetModel, body, start, rcKey)
 		} else {
-			s.handleNonStreamResponse(w, resp, r, areq.Model, targetModel, body, start, oreq.PromptCacheKey)
+			s.handleNonStreamResponse(w, resp, r, areq.Model, targetModel, body, start, rcKey)
 		}
 	}
 }
@@ -240,7 +243,7 @@ func (s *Server) proxyNativeAnthropic(
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	if areq.Stream && resp.StatusCode < http.StatusBadRequest &&
 		(contentType == "" || strings.Contains(contentType, "text/event-stream")) {
-		s.relayNativeAnthropicStream(w, resp, r, areq.Model, targetModel, body, start)
+		s.relayNativeAnthropicStream(w, resp, r, areq.Model, targetModel, body, start, cacheKey)
 		return
 	}
 	s.relayNativeAnthropicJSON(w, resp, r, areq.Model, targetModel, areq.Stream, body, start, cacheKey)
@@ -316,6 +319,7 @@ func (s *Server) relayNativeAnthropicStream(
 	inModel, target string,
 	reqBody []byte,
 	start time.Time,
+	cacheKey string,
 ) {
 	defer resp.Body.Close()
 	flusher, ok := w.(http.Flusher)
@@ -345,6 +349,8 @@ func (s *Server) relayNativeAnthropicStream(
 		flusher:  flusher,
 		log:      &responseLog,
 		logLimit: s.cfg.Snapshot().MaxBodyLogBytes,
+		cacheKey: cacheKey,
+		targetModel: target,
 	}
 	if _, err := io.Copy(relay, reader); err != nil {
 		errPayload, _ := json.Marshal(map[string]any{
@@ -355,6 +361,11 @@ func (s *Server) relayNativeAnthropicStream(
 		flusher.Flush()
 		s.logFailed(r.Context(), r, inModel, target, true, http.StatusBadGateway, err.Error(), reqBody, time.Since(start))
 		return
+	}
+
+	// Cache the reconstructed response.
+	if resp.StatusCode == http.StatusOK && cacheKey != "" {
+		relay.cacheResponse(s)
 	}
 
 	s.logSuccessWithCache(r.Context(), r, inModel, target, true, resp.StatusCode,
@@ -376,6 +387,94 @@ type nativeAnthropicStreamRelay struct {
 	cachedInputTokens        int
 	cacheCreationInputTokens int
 	stopReason               string
+
+	cacheKey    string
+	targetModel string
+	dataBuf     bytes.Buffer
+}
+
+// cacheResponse reconstructs a full Anthropic response from buffered SSE data
+// and stores it in the server's response cache (converted to OpenAI format).
+func (r *nativeAnthropicStreamRelay) cacheResponse(s *Server) {
+	if r.cacheKey == "" || r.dataBuf.Len() == 0 {
+		return
+	}
+
+	// Reconstruct Anthropic response from buffered SSE events.
+	var anthResp proxy.AnthropicResponse
+	var outputTokens int
+	var textBuilder strings.Builder
+
+	scanner := bufio.NewScanner(&r.dataBuf)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var evt struct {
+			Type    string `json:"type"`
+			Message *struct {
+				ID      string               `json:"id"`
+				Model   string               `json:"model"`
+				Usage   proxy.AnthropicUsage `json:"usage"`
+			} `json:"message,omitempty"`
+			ContentBlock *proxy.AnthropicContent `json:"content_block,omitempty"`
+			Delta        *struct {
+				Type       string  `json:"type"`
+				Text       string  `json:"text,omitempty"`
+				StopReason *string `json:"stop_reason,omitempty"`
+			} `json:"delta,omitempty"`
+			Usage *struct {
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage,omitempty"`
+		}
+		if json.Unmarshal([]byte(line), &evt) != nil {
+			continue
+		}
+		switch evt.Type {
+		case "message_start":
+			if evt.Message != nil {
+				anthResp.ID = evt.Message.ID
+				anthResp.Model = evt.Message.Model
+				anthResp.Usage = evt.Message.Usage
+			}
+		case "content_block_delta":
+			if evt.Delta != nil && evt.Delta.Type == "text_delta" {
+				textBuilder.WriteString(evt.Delta.Text)
+			}
+		case "content_block_start":
+			if evt.ContentBlock != nil && evt.ContentBlock.Type == "text" {
+				textBuilder.WriteString(evt.ContentBlock.Text)
+			}
+		case "message_delta":
+			if evt.Usage != nil {
+				outputTokens = evt.Usage.OutputTokens
+			}
+			if evt.Delta != nil && evt.Delta.StopReason != nil {
+				stop := *evt.Delta.StopReason
+				anthResp.StopReason = &stop
+			}
+		}
+	}
+
+	text := textBuilder.String()
+	if text != "" {
+		anthResp.Content = []proxy.AnthropicContent{
+			{Type: "text", Text: text},
+		}
+	}
+	anthResp.Usage.OutputTokens = outputTokens
+
+	// Convert Anthropic to OpenAI JSON for cache.
+	anthBody, err := json.Marshal(anthResp)
+	if err != nil {
+		return
+	}
+	openAIBody, err := proxy.AnthropicToOpenAIJSON(anthBody)
+	if err != nil {
+		return
+	}
+	s.storeInCache(r.cacheKey, r.targetModel, openAIBody)
 }
 
 func (r *nativeAnthropicStreamRelay) Write(p []byte) (int, error) {
@@ -430,6 +529,11 @@ func (r *nativeAnthropicStreamRelay) observe(p []byte) {
 		}
 		if event.Delta.StopReason != nil {
 			r.stopReason = *event.Delta.StopReason
+		}
+		// Buffer data for cache reconstruction.
+		if r.cacheKey != "" {
+			r.dataBuf.WriteString(data)
+			r.dataBuf.WriteByte('\n')
 		}
 	}
 }
@@ -494,7 +598,7 @@ func (s *Server) handleNonStreamResponse(w http.ResponseWriter, resp *http.Respo
 
 // handleStreamResponse proxies the SSE stream, converting each OpenAI chunk to
 // Anthropic events. It flushes continuously so the client sees real-time data.
-func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response, r *http.Request, inModel, target string, reqBody []byte, start time.Time) {
+func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response, r *http.Request, inModel, target string, reqBody []byte, start time.Time, cacheKey string) {
 	defer resp.Body.Close()
 
 	flusher, ok := w.(http.Flusher)
@@ -530,11 +634,17 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response
 		}
 	}
 
+	// Buffer chunks for cache reconstruction.
+	var chunks []*proxy.OpenAIStreamChunk
+
 	streamErr := proxy.ScanOpenAIStream(bodyReader, func(chunk *proxy.OpenAIStreamChunk) error {
 		if chunk.Usage != nil {
 			inputTok = chunk.Usage.PromptTokens
 			outputTok = chunk.Usage.CompletionTokens
 			cachedInputTok = chunk.Usage.CachedPromptTokens()
+		}
+		if cacheKey != "" {
+			chunks = append(chunks, chunk)
 		}
 		return conv.HandleChunk(chunk)
 	})
@@ -553,9 +663,73 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response
 	_ = conv.Flush()
 	flusher.Flush()
 
+	// Cache the reconstructed response.
+	if resp.StatusCode == http.StatusOK && cacheKey != "" && len(chunks) > 0 {
+		s.cacheOpenAIChunks(cacheKey, target, chunks)
+	}
+
 	// Log.
 	s.logSuccessWithCache(r.Context(), r, inModel, target, true, http.StatusOK,
 		inputTok, outputTok, cachedInputTok, 0, stopReason, string(reqBody), "[streamed]", time.Since(start))
+}
+
+// cacheOpenAIChunks reconstructs a full OpenAI response from buffered streaming
+// chunks and stores it in the response cache.
+func (s *Server) cacheOpenAIChunks(cacheKey, targetModel string, chunks []*proxy.OpenAIStreamChunk) {
+	var (
+		id, model   string
+		contentBuilder strings.Builder
+		finishReason   string
+		lastUsage      *proxy.OpenAIUsage
+	)
+	for _, chunk := range chunks {
+		if id == "" && chunk.ID != "" {
+			id = chunk.ID
+		}
+		if model == "" && chunk.Model != "" {
+			model = chunk.Model
+		}
+		for _, choice := range chunk.Choices {
+			if choice.Delta.Content != "" {
+				contentBuilder.WriteString(choice.Delta.Content)
+			}
+			if choice.FinishReason != nil {
+				finishReason = *choice.FinishReason
+			}
+		}
+		if chunk.Usage != nil {
+			lastUsage = chunk.Usage
+		}
+	}
+	if lastUsage == nil {
+		return
+	}
+	if finishReason == "" {
+		finishReason = "stop"
+	}
+	if id == "" {
+		id = "chatcmpl-stream"
+	}
+	bodyMap := map[string]any{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]any{{
+			"index": 0,
+			"message": map[string]any{
+				"role":    "assistant",
+				"content": contentBuilder.String(),
+			},
+			"finish_reason": finishReason,
+			"logprobs":      nil,
+		}},
+		"usage": lastUsage,
+	}
+	body, _ := json.Marshal(bodyMap)
+	if body != nil {
+		s.storeInCache(cacheKey, targetModel, body)
+	}
 }
 
 // CountTokens handles POST /v1/messages/count_tokens with a rough estimate
@@ -635,6 +809,8 @@ func (s *Server) logSuccessWithCache(ctx context.Context, r *http.Request, inMod
 	}()
 	s.recordUsage(apiKey, inputTok+outputTok, 1)
 }
+
+
 
 // recordUsage bumps the key's quota counters (lifetime + daily). No-op if no
 // authenticated key is present.
