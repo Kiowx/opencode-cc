@@ -60,7 +60,14 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 		applyResponsesThinkingMapping(chatReq, targetModel, cfg)
 		proxy.ApplyOpenAIPromptCache(chatReq, promptCacheOptionsFromConfig(cfg))
 
-		rcKey := responseCacheKey(body)
+		upBody, err := json.Marshal(chatReq)
+		if err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "api_error",
+				"could not encode upstream request: "+err.Error())
+			return
+		}
+
+		rcKey := responseCacheKey(upBody)
 
 		// Attempt to serve from local response cache.
 		if s.tryServeFromCache(w, r, rcKey, incomingModel,
@@ -70,13 +77,6 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 
 		if cfg.NativeAnthropic && proxy.IsNativeAnthropicModel(targetModel) {
 			s.proxyResponsesViaAnthropic(w, r, in, cfg, upstream, zenKey, incomingModel, targetModel, body, start, rcKey)
-			return
-		}
-
-		upBody, err := json.Marshal(chatReq)
-		if err != nil {
-			writeOpenAIError(w, http.StatusInternalServerError, "api_error",
-				"could not encode upstream request: "+err.Error())
 			return
 		}
 

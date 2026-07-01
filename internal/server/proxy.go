@@ -60,7 +60,14 @@ func (s *Server) Proxy() http.HandlerFunc {
 		applyThinkingBudgetMapping(oreq, &areq, targetModel, cfg)
 		proxy.ApplyOpenAIPromptCache(oreq, promptCacheOptionsFromConfig(cfg))
 
-		rcKey := responseCacheKey(body)
+		// Marshal the upstream request early — needed for cache key.
+		upBody, err := json.Marshal(oreq)
+		if err != nil {
+			writeAnthropicError(w, http.StatusInternalServerError, "api_error", "could not encode upstream request: "+err.Error())
+			return
+		}
+
+		rcKey := responseCacheKey(upBody)
 
 		// Attempt to serve from local response cache.
 		if s.tryServeFromCache(w, r, rcKey, areq.Model,
@@ -82,13 +89,6 @@ func (s *Server) Proxy() http.HandlerFunc {
 		}
 
 		if s.handleWebSearchShim(w, r, body, &areq, oreq, upstream, zenKey, targetModel, cfg, timeoutSeconds, start) {
-			return
-		}
-
-		// Marshal the upstream request.
-		upBody, err := json.Marshal(oreq)
-		if err != nil {
-			writeAnthropicError(w, http.StatusInternalServerError, "api_error", "could not encode upstream request: "+err.Error())
 			return
 		}
 
