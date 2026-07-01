@@ -131,24 +131,10 @@ type Config struct {
 	ResponseCacheTTLSeconds int `json:"response_cache_ttl_seconds"`
 	// ResponseCacheMaxEntries caps the in-memory cache size.
 	ResponseCacheMaxEntries int `json:"response_cache_max_entries"`
-	// ResponseCacheWarmupEnabled pre-populates the response cache on startup
-	// with the configured warmup prompts.
-	ResponseCacheWarmupEnabled bool `json:"response_cache_warmup_enabled"`
-	// ResponseCacheWarmupPrompts is a list of prompt templates sent on startup.
-	ResponseCacheWarmupPrompts []WarmupPrompt `json:"response_cache_warmup_prompts"`
-
 	dataDir     string
 	configPath  string
 	mu          sync.RWMutex
 	currentIdx  uint64 // sticky-primary cursor for NextUpstream (atomic); advances only on failure
-}
-
-// WarmupPrompt describes a request to send during cache warm-up.
-type WarmupPrompt struct {
-	Model       string            `json:"model"`
-	System      string            `json:"system,omitempty"`
-	UserMessage string            `json:"user_message"`
-	Tools       []json.RawMessage `json:"tools,omitempty"`
 }
 
 // Patch represents a partial update from the control panel. Pointer fields
@@ -178,8 +164,6 @@ type Patch struct {
 	ResponseCacheEnabled        *bool                    `json:"response_cache_enabled"`
 	ResponseCacheTTLSeconds     *int                     `json:"response_cache_ttl_seconds"`
 	ResponseCacheMaxEntries     *int                     `json:"response_cache_max_entries"`
-	ResponseCacheWarmupEnabled  *bool                    `json:"response_cache_warmup_enabled"`
-	ResponseCacheWarmupPrompts  *[]WarmupPrompt          `json:"response_cache_warmup_prompts"`
 }
 
 // Default returns a Config populated with sensible defaults.
@@ -445,8 +429,6 @@ func (c *Config) Snapshot() *Config {
 		ResponseCacheEnabled:        c.ResponseCacheEnabled,
 		ResponseCacheTTLSeconds:     c.ResponseCacheTTLSeconds,
 		ResponseCacheMaxEntries:     c.ResponseCacheMaxEntries,
-		ResponseCacheWarmupEnabled:  c.ResponseCacheWarmupEnabled,
-		ResponseCacheWarmupPrompts:  c.ResponseCacheWarmupPrompts,
 	}
 	if c.ModelMappings != nil {
 		cp.ModelMappings = append([]ModelMapping(nil), c.ModelMappings...)
@@ -667,12 +649,6 @@ func (c *Config) ApplyPatch(src *Patch) {
 	}
 	if src.ResponseCacheMaxEntries != nil && *src.ResponseCacheMaxEntries > 0 {
 		c.ResponseCacheMaxEntries = *src.ResponseCacheMaxEntries
-	}
-	if src.ResponseCacheWarmupEnabled != nil {
-		c.ResponseCacheWarmupEnabled = *src.ResponseCacheWarmupEnabled
-	}
-	if src.ResponseCacheWarmupPrompts != nil {
-		c.ResponseCacheWarmupPrompts = append([]WarmupPrompt(nil), (*src.ResponseCacheWarmupPrompts)...)
 	}
 }
 

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"net/http"
 	"strings"
 	"time"
@@ -109,7 +108,6 @@ func (s *Server) Start(handler http.Handler) error {
 		ReadHeaderTimeout: 10 * time.Second,
 		// WriteTimeout left at 0 so long streams are not killed.
 	}
-	go s.warmupCache(context.Background())
 	go s.cleanupCacheStore()
 	return s.srv.ListenAndServe()
 }

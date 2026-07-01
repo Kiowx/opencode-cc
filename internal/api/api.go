@@ -319,8 +319,6 @@ func publicConfig(c *config.Config) map[string]any {
 		"response_cache_enabled":              c.ResponseCacheEnabled,
 		"response_cache_ttl_seconds":           c.ResponseCacheTTLSeconds,
 		"response_cache_max_entries":           c.ResponseCacheMaxEntries,
-		"response_cache_warmup_enabled":        c.ResponseCacheWarmupEnabled,
-		"response_cache_warmup_prompts":        c.ResponseCacheWarmupPrompts,
 		"thinking_budget_mappings":            c.ThinkingBudgetMappings,
 	}
 }
