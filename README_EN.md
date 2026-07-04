@@ -218,7 +218,7 @@ docker rm -f opencode-cc
 # Re-run the one-command deployment above
 ```
 
-Replace `latest` with a version such as `1.3.0` to pin a release. To build locally instead:
+Replace `latest` with a version such as `1.3.1` to pin a release. To build locally instead:
 
 ```bash
 docker build -t opencode-cc .
