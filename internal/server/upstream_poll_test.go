@@ -12,9 +12,8 @@ import (
 	"github.com/Kiowx/opencode-cc/internal/config"
 )
 
-// TestRoundRobinUpstreamsAcrossRequests verifies that consecutive proxy
-// requests cycle through the configured upstream pool, sending each to a
-// different upstream key in order.
+// TestRoundRobinUpstreamsAcrossRequests verifies that requests without a
+// prompt-cache sticky key still cycle through the configured upstream pool.
 func TestRoundRobinUpstreamsAcrossRequests(t *testing.T) {
 	// Two mock upstreams that record which key hit them.
 	var mu sync.Mutex
@@ -43,6 +42,7 @@ func TestRoundRobinUpstreamsAcrossRequests(t *testing.T) {
 	defer zenB.Close()
 
 	cfg := config.Default()
+	cfg.PromptCacheEnabled = false
 	cfg.Upstreams = []config.Upstream{
 		{BaseURL: zenA.URL, APIKey: "key-A", Enabled: true},
 		{BaseURL: zenB.URL, APIKey: "key-B", Enabled: true},

@@ -41,16 +41,23 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 		incomingModel := in.Model
 		targetModel := s.cfg.ResolveModel(incomingModel)
 		cfg := s.cfg.Snapshot()
-		upstream, zenKey, ok := s.cfg.NextUpstream()
-		if !ok {
-			const msg = "no upstream API key configured. Set one in the web panel (Settings → upstreams)."
-			writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", msg)
-			s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
-				http.StatusUnauthorized, "no upstream api key", body, time.Since(start))
-			return
-		}
 
 		if cfg.NativeAnthropic && proxy.IsNativeAnthropicModel(targetModel) {
+			stickyKey := strings.TrimSpace(in.PromptCacheKey)
+			if stickyKey == "" {
+				if chatReq, convErr := proxy.ConvertResponsesRequest(in, func(string) string { return targetModel }); convErr == nil {
+					proxy.ApplyOpenAIPromptCache(chatReq, promptCacheOptionsFromConfig(cfg))
+					stickyKey = chatReq.PromptCacheKey
+				}
+			}
+			upstream, zenKey, ok := s.cfg.NextUpstreamForKey(stickyKey)
+			if !ok {
+				const msg = "no upstream API key configured. Set one in the web panel (Settings → upstreams)."
+				writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", msg)
+				s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
+					http.StatusUnauthorized, "no upstream api key", body, time.Since(start))
+				return
+			}
 			s.proxyResponsesViaAnthropic(w, r, in, cfg, upstream, zenKey, incomingModel, targetModel, body, start)
 			return
 		}
@@ -62,6 +69,14 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 		}
 		applyResponsesThinkingMapping(chatReq, targetModel, cfg)
 		proxy.ApplyOpenAIPromptCache(chatReq, promptCacheOptionsFromConfig(cfg))
+		upstream, zenKey, ok := s.cfg.NextUpstreamForKey(chatReq.PromptCacheKey)
+		if !ok {
+			const msg = "no upstream API key configured. Set one in the web panel (Settings → upstreams)."
+			writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", msg)
+			s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
+				http.StatusUnauthorized, "no upstream api key", body, time.Since(start))
+			return
+		}
 		upBody, err := json.Marshal(chatReq)
 		if err != nil {
 			writeOpenAIError(w, http.StatusInternalServerError, "api_error",

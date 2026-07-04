@@ -39,7 +39,7 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 		}
 
 		cfg := s.cfg.Snapshot()
-		upstream, zenKey, ok := s.cfg.NextUpstream()
+		upstream, zenKey, ok := s.cfg.NextUpstreamForKey(promptCacheKeyFromOpenAIBody(upBody))
 		if !ok {
 			const msg = "no upstream API key configured. Set one in the web panel (Settings → upstreams)."
 			writeOpenAIError(w, http.StatusUnauthorized, "authentication_error", msg)
@@ -123,6 +123,16 @@ func (s *Server) prepareOpenAIRequest(body []byte) ([]byte, string, string, bool
 		return nil, "", "", false, fmt.Errorf("could not encode upstream request: %w", err)
 	}
 	return upBody, incomingModel, targetModel, stream, nil
+}
+
+func promptCacheKeyFromOpenAIBody(body []byte) string {
+	var payload struct {
+		PromptCacheKey string `json:"prompt_cache_key"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.PromptCacheKey)
 }
 
 func (s *Server) relayOpenAIJSON(

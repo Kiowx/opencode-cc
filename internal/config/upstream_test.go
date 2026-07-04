@@ -44,6 +44,44 @@ func TestNextUpstreamRoundRobin(t *testing.T) {
 	}
 }
 
+func TestNextUpstreamForKeySticky(t *testing.T) {
+	c := Default()
+	c.Upstreams = []Upstream{
+		{BaseURL: "https://a.example/", APIKey: "ka", Enabled: true},
+		{BaseURL: "https://b.example", APIKey: "kb", Enabled: true},
+		{BaseURL: "https://c.example", APIKey: "kc", Enabled: false},
+	}
+
+	base, key, ok := c.NextUpstreamForKey("session-123")
+	if !ok {
+		t.Fatalf("expected ok")
+	}
+	for i := 0; i < 10; i++ {
+		gotBase, gotKey, gotOK := c.NextUpstreamForKey("session-123")
+		if !gotOK || gotBase != base || gotKey != key {
+			t.Fatalf("sticky pick changed on iteration %d: got (%q,%q,%v), want (%q,%q,true)",
+				i, gotBase, gotKey, gotOK, base, key)
+		}
+	}
+
+	empty := Default()
+	empty.Upstreams = []Upstream{
+		{BaseURL: "https://a.example", APIKey: "ka", Enabled: true},
+		{BaseURL: "https://b.example", APIKey: "kb", Enabled: true},
+	}
+	firstBase, _, ok := empty.NextUpstreamForKey("")
+	if !ok {
+		t.Fatalf("expected ok for empty sticky key")
+	}
+	secondBase, _, ok := empty.NextUpstreamForKey("")
+	if !ok {
+		t.Fatalf("expected ok for second empty sticky key")
+	}
+	if firstBase == secondBase {
+		t.Fatalf("empty sticky key should use round-robin, got %q twice", firstBase)
+	}
+}
+
 // TestNextUpstreamLegacyFallback confirms the pool-empty case falls back to the
 // legacy single UpstreamBase/ZenAPIKey fields (so existing configs keep working).
 func TestNextUpstreamLegacyFallback(t *testing.T) {

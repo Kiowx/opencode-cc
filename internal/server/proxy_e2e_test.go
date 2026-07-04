@@ -93,6 +93,54 @@ func newTestServerWithCfg(t *testing.T, cfg *config.Config) (*Server, *store.Sto
 	return New(cfg, st), st
 }
 
+func TestProxySticksSessionToSameUpstream(t *testing.T) {
+	counts := map[string]int{"a": 0, "b": 0}
+	newBackend := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			counts[name]++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{
+				"id":"chatcmpl-sticky",
+				"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+				"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
+			}`)
+		}))
+	}
+	zenA := newBackend("a")
+	defer zenA.Close()
+	zenB := newBackend("b")
+	defer zenB.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamBase = ""
+	cfg.ZenAPIKey = ""
+	cfg.Upstreams = []config.Upstream{
+		{BaseURL: zenA.URL, APIKey: "key-a", Enabled: true},
+		{BaseURL: zenB.URL, APIKey: "key-b", Enabled: true},
+	}
+	cfg.NativeAnthropic = false
+	cfg.ModelMappings = []config.ModelMapping{{Match: "*", Target: "glm-4.6"}}
+	srv, _ := newTestServerWithCfg(t, cfg)
+
+	body := []byte(`{
+		"model":"client-model",
+		"max_tokens":64,
+		"metadata":{"session_id":"sticky-session"},
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	for i := 0; i < 4; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+		rec := httptest.NewRecorder()
+		srv.Proxy().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d status %d: %s", i, rec.Code, rec.Body.String())
+		}
+	}
+	if counts["a"] != 4 && counts["b"] != 4 {
+		t.Fatalf("session was not sticky across upstreams: %+v", counts)
+	}
+}
+
 func TestProxyNonStreamEndToEnd(t *testing.T) {
 	zen := mockZen(t, false, nil)
 	srv, _ := newTestServer(t, zen.URL)
@@ -438,7 +486,7 @@ func TestProxyStreamEndToEnd(t *testing.T) {
 		// finish
 		`{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
 		// usage
-		`{"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":3,"total_tokens":11}}`,
+		`{"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":3,"total_tokens":11,"prompt_tokens_details":{"cached_tokens":5}}}`,
 	}
 	zen := mockZen(t, true, chunks)
 	srv, st := newTestServer(t, zen.URL)
@@ -473,6 +521,9 @@ func TestProxyStreamEndToEnd(t *testing.T) {
 		`"text_delta","text":", streamed"`,
 		"event: content_block_stop",
 		`"stop_reason":"end_turn"`,
+		`"input_tokens":8`,
+		`"cache_creation_input_tokens":0`,
+		`"cache_read_input_tokens":5`,
 		`"output_tokens":3`,
 		"event: message_stop",
 	} {

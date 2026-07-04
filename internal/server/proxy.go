@@ -41,17 +41,23 @@ func (s *Server) Proxy() http.HandlerFunc {
 		nativeAnthropic := cfg.NativeAnthropic
 		timeoutSeconds := cfg.RequestTimeoutSeconds
 		targetModel := s.cfg.ResolveModel(areq.Model)
+		hasWebSearch := shouldUseWebSearchShim(&areq)
+		webSearchMode := cfg.ResolveWebSearchMode()
 
-		// Pick the next upstream from the round-robin pool.
-		upstream, zenKey, ok := s.cfg.NextUpstream()
+		oreq := proxy.ConvertRequest(&areq, func(string) string { return targetModel })
+		applyThinkingBudgetMapping(oreq, &areq, targetModel, cfg)
+		proxy.ApplyOpenAIPromptCache(oreq, promptCacheOptionsFromConfig(cfg))
+		stickyKey := proxy.AnthropicPromptCacheHint(&areq)
+		if oreq.PromptCacheKey != "" {
+			stickyKey = oreq.PromptCacheKey
+		}
+
+		upstream, zenKey, ok := s.cfg.NextUpstreamForKey(stickyKey)
 		if !ok {
 			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "no upstream API key configured. Set one in the web panel (Settings → upstreams).")
 			s.logFailed(ctx, r, areq.Model, targetModel, areq.Stream, http.StatusUnauthorized, "no upstream api key", body, time.Since(start))
 			return
 		}
-
-		hasWebSearch := shouldUseWebSearchShim(&areq)
-		webSearchMode := cfg.ResolveWebSearchMode()
 		if hasWebSearch && webSearchMode == cfgpkg.WebSearchModeNative {
 			searchUpstream, searchKey := cfg.ResolveWebSearchUpstream(upstream, zenKey)
 			searchModel := cfg.ResolveWebSearchModel(targetModel)
@@ -65,9 +71,6 @@ func (s *Server) Proxy() http.HandlerFunc {
 			return
 		}
 
-		oreq := proxy.ConvertRequest(&areq, func(string) string { return targetModel })
-		applyThinkingBudgetMapping(oreq, &areq, targetModel, cfg)
-		proxy.ApplyOpenAIPromptCache(oreq, promptCacheOptionsFromConfig(cfg))
 		if s.handleWebSearchShim(w, r, body, &areq, oreq, upstream, zenKey, targetModel, cfg, timeoutSeconds, start) {
 			return
 		}

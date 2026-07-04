@@ -7,6 +7,7 @@ package config
 
 import (
 	"encoding/json"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -249,6 +250,36 @@ func (c *Config) migrateLegacyUpstream() {
 // when no usable upstream is configured (the caller should respond with an
 // "upstream not configured" error).
 func (c *Config) NextUpstream() (base, key string, ok bool) {
+	pool, legacyBase, legacyKey := c.usableUpstreams()
+	if len(pool) == 0 {
+		return legacyUpstream(legacyBase, legacyKey)
+	}
+	// Atomic round-robin: advance the cursor and pick modulo the pool size.
+	// AddUint64 returns the new value; we use (old+1) % n to spread the first
+	// pick across callers.
+	n := uint64(len(pool))
+	idx := atomic.AddUint64(&c.rr, 1) % n
+	u := pool[idx]
+	return strings.TrimRight(u.BaseURL, "/"), u.APIKey, true
+}
+
+// NextUpstreamForKey returns a stable backend for stickyKey. It is used for
+// session-like requests so provider-side prompt caches stay warm even when
+// multiple upstream keys are configured. Empty keys fall back to round-robin.
+func (c *Config) NextUpstreamForKey(stickyKey string) (base, key string, ok bool) {
+	stickyKey = strings.TrimSpace(stickyKey)
+	if stickyKey == "" {
+		return c.NextUpstream()
+	}
+	pool, legacyBase, legacyKey := c.usableUpstreams()
+	if len(pool) == 0 {
+		return legacyUpstream(legacyBase, legacyKey)
+	}
+	u := pool[stickyUpstreamIndex(stickyKey, len(pool))]
+	return strings.TrimRight(u.BaseURL, "/"), u.APIKey, true
+}
+
+func (c *Config) usableUpstreams() ([]Upstream, string, string) {
 	c.mu.RLock()
 	// Snapshot the enabled pool under the read lock.
 	pool := make([]Upstream, 0, len(c.Upstreams))
@@ -259,20 +290,20 @@ func (c *Config) NextUpstream() (base, key string, ok bool) {
 	}
 	legacyBase, legacyKey := c.UpstreamBase, c.ZenAPIKey
 	c.mu.RUnlock()
+	return pool, legacyBase, legacyKey
+}
 
-	if len(pool) == 0 {
-		if legacyBase != "" && legacyKey != "" {
-			return strings.TrimRight(legacyBase, "/"), legacyKey, true
-		}
-		return "", "", false
+func legacyUpstream(base, key string) (string, string, bool) {
+	if base != "" && key != "" {
+		return strings.TrimRight(base, "/"), key, true
 	}
-	// Atomic round-robin: advance the cursor and pick modulo the pool size.
-	// AddUint64 returns the new value; we use (old+1) % n to spread the first
-	// pick across callers.
-	n := uint64(len(pool))
-	idx := atomic.AddUint64(&c.rr, 1) % n
-	u := pool[idx]
-	return strings.TrimRight(u.BaseURL, "/"), u.APIKey, true
+	return "", "", false
+}
+
+func stickyUpstreamIndex(stickyKey string, poolSize int) int {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(stickyKey))
+	return int(h.Sum64() % uint64(poolSize))
 }
 
 // applyEnv overlays environment variables on top of the loaded config.

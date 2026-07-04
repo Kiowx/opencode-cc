@@ -41,6 +41,15 @@ func ApplyOpenAIPromptCache(req *OpenAIRequest, opts PromptCacheOptions) {
 	}
 }
 
+// AnthropicPromptCacheHint returns the stable cache/session hint derived from
+// Anthropic metadata or cache_control boundaries.
+func AnthropicPromptCacheHint(in *AnthropicRequest) string {
+	if hint := anthropicPromptCacheHint(in); hint != "" {
+		return hint
+	}
+	return anthropicCacheControlPromptCacheHint(in)
+}
+
 // ApplyRawOpenAIPromptCache normalizes a raw OpenAI-compatible request object
 // while preserving unsupported extension fields.
 func ApplyRawOpenAIPromptCache(payload map[string]json.RawMessage, opts PromptCacheOptions) {

@@ -83,9 +83,11 @@ type streamMessageBody struct {
 	StopSequence *string `json:"stop_sequence"`
 }
 
-// streamDeltaUsage only carries output_tokens in the message_delta event.
 type streamDeltaUsage struct {
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int `json:"input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
 }
 
 type streamMessageStop struct {
@@ -122,6 +124,7 @@ type StreamConverter struct {
 	nextIdx          int
 	input            int // input tokens (from final usage chunk, if upstream sends one)
 	output           int // output tokens tally (from final usage chunk)
+	cachedInput      int // cache-read input tokens (from final usage chunk)
 	restrictTools    bool
 	allowedTools     map[string]struct{}
 	acceptedToolCall bool
@@ -199,6 +202,7 @@ func (c *StreamConverter) HandleChunk(chunk *OpenAIStreamChunk) error {
 	if chunk.Usage != nil {
 		c.input = chunk.Usage.PromptTokens
 		c.output = chunk.Usage.CompletionTokens
+		c.cachedInput = chunk.Usage.CachedPromptTokens()
 	}
 
 	for _, ch := range chunk.Choices {
@@ -429,7 +433,12 @@ func (c *StreamConverter) Finalize(stopReason string) error {
 		Delta: streamMessageBody{StopReason: stop, StopSequence: c.stopSeq},
 		// Usage is emitted unconditionally (output_tokens may be 0 if the
 		// upstream never reported usage). Claude Code relies on its presence.
-		Usage: streamDeltaUsage{OutputTokens: c.output},
+		Usage: streamDeltaUsage{
+			InputTokens:              c.input,
+			CacheCreationInputTokens: 0,
+			CacheReadInputTokens:     c.cachedInput,
+			OutputTokens:             c.output,
+		},
 	}
 	if err := c.writeEvent("message_delta", payload); err != nil {
 		return err

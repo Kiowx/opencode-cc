@@ -25,7 +25,13 @@ func TestStreamConversion(t *testing.T) {
 			{ID: "call_1", Type: "function", Function: OpenAIFunctionCall{Arguments: `:"a.txt"}`}},
 		}}}}},
 		{Choices: []OpenAIChoice{{Index: 0, FinishReason: strPtr("tool_calls")}}},
-		{Usage: &OpenAIUsage{PromptTokens: 10, CompletionTokens: 20}},
+		{Usage: &OpenAIUsage{
+			PromptTokens:     10,
+			CompletionTokens: 20,
+			PromptTokensDetails: &OpenAIPromptTokensDetails{
+				CachedTokens: 6,
+			},
+		}},
 	}
 
 	var sb bytes.Buffer
@@ -79,8 +85,15 @@ func TestStreamConversion(t *testing.T) {
 		t.Errorf("expected stop_reason tool_use\n---OUTPUT---\n%s", got)
 	}
 	// Usage carried in message_delta.
-	if !strings.Contains(got, `"output_tokens":20`) {
-		t.Errorf("expected output_tokens 20 in message_delta\n---OUTPUT---\n%s", got)
+	for _, want := range []string{
+		`"input_tokens":10`,
+		`"cache_creation_input_tokens":0`,
+		`"cache_read_input_tokens":6`,
+		`"output_tokens":20`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected %s in message_delta\n---OUTPUT---\n%s", want, got)
+		}
 	}
 }
 
