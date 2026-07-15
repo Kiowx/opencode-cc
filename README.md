@@ -184,7 +184,7 @@ docker rm -f opencode-cc
 # 再执行上面的一键运行命令
 ```
 
-也可以把镜像标签从 `latest` 改为例如 `1.3.1` 来固定版本。如需本地构建：
+也可以把镜像标签从 `latest` 改为例如 `1.3.2` 来固定版本。如需本地构建：
 
 ```bash
 docker build -t opencode-cc .
