@@ -28,6 +28,11 @@ func applyThinkingBudgetMapping(req *proxy.OpenAIRequest, areq *proxy.AnthropicR
 
 	switch strings.ToLower(mapping.Field) {
 	case "thinking":
+		// Anthropic's adaptive mode is equivalent to the provider-specific
+		// auto mode accepted by GLM's OpenAI-compatible endpoint.
+		if thinkingType == "adaptive" {
+			thinkingType = "auto"
+		}
 		req.Thinking = &proxy.OpenAIThinking{Type: thinkingType}
 		if thinkingType == "enabled" && budgetTokens > 0 {
 			req.Thinking.BudgetTokens = &budgetTokens

@@ -476,6 +476,70 @@ func TestProxyMapsGLMThinkingBudgetWithoutClearThinking(t *testing.T) {
 	}
 }
 
+func TestProxyMapsAdaptiveThinkingToAutoForGLMWithTools(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			var got proxy.OpenAIRequest
+			var gotPath string
+			zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+					t.Fatalf("decode upstream request: %v", err)
+				}
+				if got.Stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-adaptive\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n")
+					_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-adaptive\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n")
+					_, _ = io.WriteString(w, "data: [DONE]\n\n")
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{
+					"id":"chatcmpl-adaptive",
+					"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+					"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}
+				}`)
+			}))
+			defer zen.Close()
+
+			cfg := config.Default()
+			cfg.UpstreamBase = zen.URL
+			cfg.ZenAPIKey = "test-key"
+			cfg.NativeAnthropic = false
+			cfg.ModelMappings = []config.ModelMapping{{Match: "*", Target: ""}}
+			srv, _ := newTestServerWithCfg(t, cfg)
+
+			body := fmt.Sprintf(`{
+				"model":"glm-5.2",
+				"max_tokens":16,
+				"stream":%t,
+				"thinking":{"type":"adaptive","budget_tokens":1024},
+				"tools":[{"name":"x","description":"d","input_schema":{"type":"object","properties":{}}}],
+				"messages":[{"role":"user","content":"hi"}]
+			}`, stream)
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			srv.Proxy().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+			}
+			if gotPath != "/v1/chat/completions" {
+				t.Fatalf("upstream path = %q, want /v1/chat/completions", gotPath)
+			}
+			if got.Thinking == nil || got.Thinking.Type != "auto" || got.Thinking.BudgetTokens != nil {
+				t.Fatalf("thinking = %+v, want auto without budget_tokens", got.Thinking)
+			}
+			if len(got.Tools) != 1 || got.Tools[0].Function.Name != "x" {
+				t.Fatalf("tools were not preserved: %+v", got.Tools)
+			}
+			if got.Stream != stream {
+				t.Fatalf("stream = %t, want %t", got.Stream, stream)
+			}
+		})
+	}
+}
+
 func TestProxyStreamEndToEnd(t *testing.T) {
 	chunks := []string{
 		// role
@@ -808,6 +872,8 @@ func TestProxyNativeAnthropicNonStream(t *testing.T) {
 		"model":"client-model",
 		"max_tokens":64,
 		"system":[{"type":"text","text":"stable","cache_control":{"type":"ephemeral"}}],
+		"thinking":{"type":"adaptive"},
+		"tools":[{"name":"x","description":"d","input_schema":{"type":"object","properties":{}}}],
 		"messages":[{"role":"user","content":"hi"}],
 		"metadata":{"trace":"keep-me"}
 	}`
@@ -837,6 +903,9 @@ func TestProxyNativeAnthropicNonStream(t *testing.T) {
 	}
 	if !bytes.Contains(gotBody["metadata"], []byte("keep-me")) {
 		t.Fatalf("unknown metadata was not preserved: %s", gotBody["metadata"])
+	}
+	if !bytes.Contains(gotBody["thinking"], []byte(`"type":"adaptive"`)) {
+		t.Fatalf("native adaptive thinking was not preserved: %s", gotBody["thinking"])
 	}
 	if !bytes.Contains(raw, []byte("native hello")) {
 		t.Fatalf("native response was not relayed: %s", raw)
