@@ -129,6 +129,7 @@ type StreamConverter struct {
 	allowedTools     map[string]struct{}
 	acceptedToolCall bool
 	reasoning        strings.Builder
+	reasoningPresent bool
 	toolIDs          []string
 
 	// OpenAI streams send finish_reason on the last content chunk and usage in
@@ -209,6 +210,9 @@ func (c *StreamConverter) HandleChunk(chunk *OpenAIStreamChunk) error {
 		// 1. reasoning_content is provider-required hidden thinking state.
 		// Emit it as an Anthropic thinking block so Claude Code can replay it
 		// on the next request without mixing it into user-visible text.
+		if ch.Delta.ReasoningContentSet || ch.Delta.ReasoningContent != "" {
+			c.reasoningPresent = true
+		}
 		if ch.Delta.ReasoningContent != "" {
 			if err := c.handleThinking(ch.Delta.ReasoningContent); err != nil {
 				return err
@@ -414,7 +418,7 @@ func (c *StreamConverter) Finalize(stopReason string) error {
 	if err := c.closeCurrent(); err != nil {
 		return err
 	}
-	cacheReasoningForToolCalls(c.reasoning.String(), c.toolIDs...)
+	cacheReasoningStateForToolCalls(c.reasoning.String(), c.reasoningPresent, c.toolIDs...)
 	// Prefer the finish_reason the upstream reported; fall back to the caller's
 	// stopReason (e.g. "stream_error").
 	reason := c.pendingFinish
