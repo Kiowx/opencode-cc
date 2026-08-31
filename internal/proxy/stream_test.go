@@ -499,6 +499,94 @@ func TestStreamReasoningContentReplayedAfterCompaction(t *testing.T) {
 	}
 }
 
+func TestStreamExplicitEmptyReasoningReplayedAfterCompaction(t *testing.T) {
+	resetReasoningContentCacheForTest()
+	var chunk OpenAIStreamChunk
+	if err := json.Unmarshal([]byte(`{
+		"choices":[{
+			"index":0,
+			"delta":{
+				"reasoning_content":"",
+				"tool_calls":[{
+					"index":0,
+					"id":"call_empty_reasoning",
+					"type":"function",
+					"function":{"name":"shell_command","arguments":"{\"command\":\"pwd\"}"}
+				}]
+			},
+			"finish_reason":"tool_calls"
+		}]
+	}`), &chunk); err != nil {
+		t.Fatal(err)
+	}
+	if !chunk.Choices[0].Delta.ReasoningContentSet {
+		t.Fatal("explicit empty reasoning_content was treated as absent")
+	}
+
+	var out bytes.Buffer
+	conv, err := NewStreamConverter(&out, "deepseek-v4-pro", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.HandleChunk(&chunk); err != nil {
+		t.Fatal(err)
+	}
+	if err := conv.Finalize("tool_use"); err != nil {
+		t.Fatal(err)
+	}
+	match := regexp.MustCompile(`"type":"tool_use","id":"([^"]+)"`).FindStringSubmatch(out.String())
+	if len(match) != 2 {
+		t.Fatalf("tool_use id missing in stream:\n%s", out.String())
+	}
+
+	req := ConvertRequest(&AnthropicRequest{
+		Model:     "deepseek-v4-pro",
+		MaxTokens: 128,
+		Messages: []AnthropicMessage{{
+			Role: "assistant",
+			Content: AnthropicMessageContent{Blocks: []AnthropicContent{{
+				Type: "tool_use", ID: match[1], Name: "shell_command", Input: jsonRawMessage(`{"command":"pwd"}`),
+			}}},
+		}},
+	}, func(model string) string { return model })
+	if !req.Messages[0].ReasoningContentSet || req.Messages[0].ReasoningContent != "" {
+		t.Fatalf("empty reasoning replay state = (%q, %v), want explicit empty", req.Messages[0].ReasoningContent, req.Messages[0].ReasoningContentSet)
+	}
+	wire, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(wire, []byte(`"reasoning_content":""`)) {
+		t.Fatalf("explicit empty reasoning_content missing on wire: %s", wire)
+	}
+}
+
+func TestMessageExplicitEmptyReasoningSurvivesJSONRoundTrip(t *testing.T) {
+	var message OpenAIMessage
+	if err := json.Unmarshal([]byte(`{
+		"role":"assistant",
+		"content":"",
+		"reasoning_content":"",
+		"tool_calls":[{
+			"id":"call_empty_reasoning",
+			"type":"function",
+			"function":{"name":"shell_command","arguments":"{}"}
+		}]
+	}`), &message); err != nil {
+		t.Fatal(err)
+	}
+	if !message.ReasoningContentSet || message.ReasoningContent != "" {
+		t.Fatalf("empty reasoning state = (%q, %v), want explicit empty", message.ReasoningContent, message.ReasoningContentSet)
+	}
+	wire, err := json.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(wire, []byte(`"reasoning_content":""`)) {
+		t.Fatalf("explicit empty reasoning_content missing after round trip: %s", wire)
+	}
+}
+
 // TestRequestConversion checks tool_use/tool_result round trip in requests.
 func TestRequestConversion(t *testing.T) {
 	in := &AnthropicRequest{

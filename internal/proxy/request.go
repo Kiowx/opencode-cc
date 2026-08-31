@@ -168,6 +168,7 @@ func convertAssistantBlocks(m AnthropicMessage) []OpenAIMessage {
 	var toolCalls []OpenAIToolCall
 	var parts []OpenAIContentPart
 	hasText := false
+	reasoningPresent := false
 	for _, b := range m.Content.Blocks {
 		switch b.Type {
 		case "text":
@@ -188,16 +189,18 @@ func convertAssistantBlocks(m AnthropicMessage) []OpenAIMessage {
 			// assistant message. Claude Code sends that back as an Anthropic
 			// thinking block, so preserve it structurally instead of emitting it
 			// as user-visible text.
+			reasoningPresent = true
 			msg.ReasoningContent += thinkingText(b)
 		default:
 			parts = append(parts, OpenAIContentPart{Type: "text", Text: b.Text})
 			hasText = true
 		}
 	}
-	if msg.ReasoningContent == "" && len(toolCalls) > 0 {
-		msg.ReasoningContent = cachedReasoningForToolCalls(toolCallIDs(toolCalls))
-	} else if msg.ReasoningContent != "" && len(toolCalls) > 0 {
-		cacheReasoningForToolCalls(msg.ReasoningContent, toolCallIDs(toolCalls)...)
+	msg.ReasoningContentSet = reasoningPresent
+	if !msg.ReasoningContentSet && len(toolCalls) > 0 {
+		msg.ReasoningContent, msg.ReasoningContentSet = cachedReasoningStateForToolCalls(toolCallIDs(toolCalls))
+	} else if msg.ReasoningContentSet && len(toolCalls) > 0 {
+		cacheReasoningStateForToolCalls(msg.ReasoningContent, true, toolCallIDs(toolCalls)...)
 	}
 	if len(parts) > 0 {
 		if len(parts) == 1 {

@@ -45,7 +45,8 @@ func ConvertResponse(in *OpenAIResponse, requestModel string) *AnthropicResponse
 		for _, tc := range choice.Message.ToolCalls {
 			block := toolCallToBlock(tc)
 			out.Content = append(out.Content, block)
-			cacheReasoningForToolCalls(choice.Message.ReasoningContent, block.ID)
+			cacheReasoningStateForToolCalls(choice.Message.ReasoningContent,
+				choice.Message.ReasoningContentSet || choice.Message.ReasoningContent != "", block.ID)
 			hasToolUse = true
 		}
 		if choice.Message.FunctionCall != nil {
@@ -54,7 +55,8 @@ func ConvertResponse(in *OpenAIResponse, requestModel string) *AnthropicResponse
 				Function: *choice.Message.FunctionCall,
 			})
 			out.Content = append(out.Content, block)
-			cacheReasoningForToolCalls(choice.Message.ReasoningContent, block.ID)
+			cacheReasoningStateForToolCalls(choice.Message.ReasoningContent,
+				choice.Message.ReasoningContentSet || choice.Message.ReasoningContent != "", block.ID)
 			hasToolUse = true
 		}
 	}

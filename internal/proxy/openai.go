@@ -43,13 +43,50 @@ type OpenAIStreamOptions struct {
 
 // OpenAIMessage is one chat message.
 type OpenAIMessage struct {
-	Role             string              `json:"role"`
-	Content          any                 `json:"content,omitempty"` // string or []OpenAIContentPart
-	ReasoningContent string              `json:"reasoning_content,omitempty"`
-	ToolCalls        []OpenAIToolCall    `json:"tool_calls,omitempty"`
-	FunctionCall     *OpenAIFunctionCall `json:"function_call,omitempty"`
-	ToolCallID       string              `json:"tool_call_id,omitempty"`
-	Name             string              `json:"name,omitempty"`
+	Role                string              `json:"role"`
+	Content             any                 `json:"content,omitempty"` // string or []OpenAIContentPart
+	ReasoningContent    string              `json:"reasoning_content,omitempty"`
+	ReasoningContentSet bool                `json:"-"`
+	ToolCalls           []OpenAIToolCall    `json:"tool_calls,omitempty"`
+	FunctionCall        *OpenAIFunctionCall `json:"function_call,omitempty"`
+	ToolCallID          string              `json:"tool_call_id,omitempty"`
+	Name                string              `json:"name,omitempty"`
+}
+
+// UnmarshalJSON remembers whether reasoning_content was present even when its
+// value was the empty string. Some reasoning providers return an explicit
+// empty value on a valid tool-call turn and require that exact field to be
+// replayed later.
+func (m *OpenAIMessage) UnmarshalJSON(data []byte) error {
+	type messageAlias OpenAIMessage
+	var decoded messageAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*m = OpenAIMessage(decoded)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	_, m.ReasoningContentSet = fields["reasoning_content"]
+	return nil
+}
+
+// MarshalJSON keeps an explicitly empty reasoning_content on the wire.
+// The ordinary omitempty behavior remains unchanged when the field was never
+// present and no replay state was recovered.
+func (m OpenAIMessage) MarshalJSON() ([]byte, error) {
+	type messageAlias OpenAIMessage
+	raw, err := json.Marshal(messageAlias(m))
+	if err != nil || !m.ReasoningContentSet || m.ReasoningContent != "" {
+		return raw, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	fields["reasoning_content"] = json.RawMessage(`""`)
+	return json.Marshal(fields)
 }
 
 // OpenAIContentPart is one part of a multi-part message (images / text).
@@ -139,11 +176,27 @@ type OpenAIChoice struct {
 
 // OpenAIDelta is the streaming delta.
 type OpenAIDelta struct {
-	Role             string              `json:"role,omitempty"`
-	Content          string              `json:"content,omitempty"`
-	ReasoningContent string              `json:"reasoning_content,omitempty"`
-	ToolCalls        []OpenAIToolCall    `json:"tool_calls,omitempty"`
-	FunctionCall     *OpenAIFunctionCall `json:"function_call,omitempty"`
+	Role                string              `json:"role,omitempty"`
+	Content             string              `json:"content,omitempty"`
+	ReasoningContent    string              `json:"reasoning_content,omitempty"`
+	ReasoningContentSet bool                `json:"-"`
+	ToolCalls           []OpenAIToolCall    `json:"tool_calls,omitempty"`
+	FunctionCall        *OpenAIFunctionCall `json:"function_call,omitempty"`
+}
+
+func (d *OpenAIDelta) UnmarshalJSON(data []byte) error {
+	type deltaAlias OpenAIDelta
+	var decoded deltaAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*d = OpenAIDelta(decoded)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	_, d.ReasoningContentSet = fields["reasoning_content"]
+	return nil
 }
 
 // OpenAIUsage is the usage block.
